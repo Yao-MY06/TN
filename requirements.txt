@@ -1,0 +1,12 @@
+# 运行 tt/ 与 adapter/ 所需的依赖
+# 注意：模型推理（tracknet_adapter.py --video）还需要 PyTorch，
+#       版本要跟随显卡，不写死在这里，按 TrackNet 侧的安装说明处理。
+
+numpy>=1.24
+opencv-python>=4.8
+
+# 仅 adapter/eval_mot.py（MOT 指标评估）需要
+motmetrics>=1.4
+
+# 仅在校验 contract/*.schema.json 自身合法性时需要
+jsonschema>=4.17

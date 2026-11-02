@@ -1,0 +1,13 @@
+{
+  "_comment": "球台台面四角标定（原图 1920x1080 坐标）。顺序：far_left, far_right, near_right, near_left 顺时针。game_4 由台面蓝色区域颜色分割自动拟合（5 帧交叉验证，角点抖动 <5px）；test_2 因左右半台光照不均，颜色分割只截到右半台，改用放大裁切目视标定。",
+  "game_4": {
+    "points": [[531, 613], [1267, 614], [1406, 773], [406, 787]],
+    "method": "auto_color_segment",
+    "verified_frames": [1000, 5000, 20000, 40000, 60000]
+  },
+  "test_2": {
+    "points": [[540, 516], [1330, 532], [1484, 656], [352, 631]],
+    "method": "manual_zoom",
+    "verified_frames": [1200]
+  }
+}

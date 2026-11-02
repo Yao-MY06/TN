@@ -1,0 +1,99 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Unified ball observation (TTNet / TrackNet / YOLO)",
+  "description": "三个模型适配器共用的逐帧观测格式。坐标均为原始图像像素坐标，左上角为原点，向右 x 正、向下 y 正。",
+  "type": "object",
+  "required": ["frame_id", "timestamp_s", "source", "image_size", "ball", "event_scores"],
+  "additionalProperties": false,
+  "properties": {
+    "frame_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "帧序号，从 0 开始，与被预测帧一一对应"
+    },
+    "timestamp_s": {
+      "type": "number",
+      "minimum": 0,
+      "description": "被预测帧的视频时间（秒），不是推理完成时间"
+    },
+    "source": {
+      "type": "string",
+      "enum": ["yolo", "tracknet", "ttnet"],
+      "description": "产生该观测的模型"
+    },
+    "image_size": {
+      "type": "array",
+      "items": {"type": "number", "exclusiveMinimum": 0},
+      "minItems": 2,
+      "maxItems": 2,
+      "description": "原始图像尺寸 [width, height]"
+    },
+    "ball": {
+      "type": "object",
+      "required": ["visible", "center_px", "bbox_xyxy", "confidence"],
+      "additionalProperties": false,
+      "properties": {
+        "visible": {
+          "type": "boolean",
+          "description": "该帧是否检测到球。漏检/遮挡/出画一律为 false"
+        },
+        "center_px": {
+          "description": "球心像素坐标 [x, y]；visible=false 时必须为 null，不得填上一帧位置或 (0,0)",
+          "oneOf": [
+            {
+              "type": "array",
+              "items": {"type": "number"},
+              "minItems": 2,
+              "maxItems": 2
+            },
+            {"type": "null"}
+          ]
+        },
+        "bbox_xyxy": {
+          "description": "检测框 [x1, y1, x2, y2]；无检测框的模型（TrackNet）填 null",
+          "oneOf": [
+            {
+              "type": "array",
+              "items": {"type": "number"},
+              "minItems": 4,
+              "maxItems": 4
+            },
+            {"type": "null"}
+          ]
+        },
+        "confidence": {
+          "description": "模型自身分数，0~1；无可靠分数时为 null。不同模型之间不可直接比较",
+          "oneOf": [
+            {"type": "number", "minimum": 0, "maximum": 1},
+            {"type": "null"}
+          ]
+        },
+        "predicted": {
+          "type": "boolean",
+          "default": false,
+          "description": "可选。true 表示 center_px 是轨迹推断位置而非模型检出（方案文档 7.3），此时 confidence 必须为 null。缺省 false"
+        }
+      }
+    },
+    "event_scores": {
+      "type": "object",
+      "required": ["bounce", "net_hit"],
+      "additionalProperties": false,
+      "description": "模型自带的事件候选分数；模型没有该能力时填 null。这些只是候选分数，不是已确认事件",
+      "properties": {
+        "bounce": {
+          "oneOf": [
+            {"type": "number", "minimum": 0, "maximum": 1},
+            {"type": "null"}
+          ]
+        },
+        "net_hit": {
+          "oneOf": [
+            {"type": "number", "minimum": 0, "maximum": 1},
+            {"type": "null"}
+          ]
+        }
+      }
+    }
+  }
+}

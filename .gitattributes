@@ -1,0 +1,13 @@
+# 默认按文本处理，仓库内统一 LF，避免 Windows 上 CRLF 差异污染 diff
+* text=auto eol=lf
+
+*.py   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.sh   text eol=lf
+
+# 二进制：不要做换行转换，也不要尝试 diff
+*.png  binary
+*.jpg  binary
+*.docx binary

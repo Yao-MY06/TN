@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Unified event (event layer output)",
+  "description": "事件处理层的输出，交给共用计分状态机。适配器不产生本结构；由 Observation 经轨迹规则或模型自带的事件分数得到。",
+  "type": "object",
+  "required": ["event_id", "timestamp_s", "type", "side", "position_px", "confidence", "sources"],
+  "additionalProperties": false,
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "description": "事件唯一标识，例如 bounce_00042"
+    },
+    "timestamp_s": {
+      "type": "number",
+      "minimum": 0,
+      "description": "事件发生的视频时间（秒），不是推理完成时间"
+    },
+    "type": {
+      "type": "string",
+      "enum": ["BOUNCE", "RACKET_HIT", "NET_TOUCH", "OUT"],
+      "description": "事件类型：落台 / 球拍击球 / 擦网 / 出界。擦网重发（LET）与得分方属于状态机输出，不是物理事件，不进本枚举。"
+    },
+    "side": {
+      "type": "string",
+      "enum": ["A", "B", "UNKNOWN"],
+      "description": "事件发生在哪一侧半台。A 为 far_left/near_left 一侧（图像左侧），压线或无法判定时为 UNKNOWN"
+    },
+    "position_px": {
+      "type": ["array", "null"],
+      "items": {"type": "number"},
+      "minItems": 2,
+      "maxItems": 2,
+      "description": "事件位置，原始图像像素坐标 [x, y]；无位置信息时为 null"
+    },
+    "confidence": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1,
+      "description": "事件置信度。规则法没有概率输出时填 null，不要填凑数"
+    },
+    "sources": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "产生该事件的观测来源，例如 [\"tracknet\"]；多模型融合后可能有多项"
+    }
+  }
+}
