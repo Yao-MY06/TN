@@ -19,12 +19,20 @@ backup/
 # ============================================================
 # 模型侧的大目录：数据集、训练输出、权重
 # 上游仓库（yastrebksv/TrackNet）源码保留在 TrackNet/ 内，随本仓库一同管理
+#
+# exps/ 的例外：四个自训实验的 model_best.pt 已入库。
+# 它们是乒乓球权重，重跑要 38 G 数据 + 完整训练，属不可重建资产；
+# model_last.pt / model_best_ep2.pt 等中间态仍排除。
+# 注意规则写法：用 exps/*/* 而不是 exps/ —— 一旦把目录本身排除，
+# 后面的 ! 白名单就不会生效（git 不进入被忽略的目录）。
 # ============================================================
 datasets/
-exps/
 weights/
 checkpoints/
 *.gif
+
+TrackNet/TrackNet/exps/*/*
+!TrackNet/TrackNet/exps/*/model_best.pt
 
 # ============================================================
 # 状态机交付件：已解压入库，见 tt/_unpacked/README.md

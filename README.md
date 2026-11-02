@@ -40,7 +40,8 @@
 │   │   ├── prepare_openttgames.py   数据转换
 │   │   ├── detect_bounce.py         落台检测
 │   │   ├── events_from_observations.py  Observation → 事件
-│   │   └── exps/ datasets/          训练输出与数据（不进仓库）
+│   │   ├── exps/tt_*/model_best.pt  四份乒乓球权重（入库，各 41 MB）
+│   │   └── datasets/                训练数据 5.2 G（不进仓库）
 │   └── calib/                     标定过程截图
 ├── calib/table_quads.json       球台四角标定（换机位必须重标）
 ├── docs/otherdata/              方案文档、对接清单等外部资料
@@ -105,10 +106,9 @@ python tt/run_mixed.py \
 
 ### 4. 从视频重跑（完整链路）
 
-> **前置**：这一步需要两样仓库里没有的东西——待测视频（`_data/`）和模型权重（`exps/tt_g345_aug/model_best.pt`，41 MB），
-> 都按文末「与上游的关系」里「不进仓库的」说明另行获取。**只想验证链路是否通，用第 3 步的自包含 demo 就够**，不需要这些。
->
-> ⚠️ `weights/model_best.pt` **不是**这份权重，见下方表格。
+> **前置**：模型权重**已随仓库提供**（`TrackNet/TrackNet/exps/tt_g345_aug/model_best.pt`，41 MB，clone 下来就有）。
+> 只需另外准备待测视频（`_data/`），获取方式见文末「不进仓库的」。
+> **只想验证链路是否通，用第 3 步的自包含 demo 就够**，不需要这些。
 
 ```bash
 # a) 推理 → Observation（要权重）
@@ -205,42 +205,47 @@ python tt/run_mixed.py \
 | `calibrate_table.py` | 球台四角标定 | 新增 |
 | `gt_gen.py` / `main.py` / `datasets.py` / `general.py` / `test.py` | 乒乓球适配改造 | 修改 |
 
-**不进仓库的**（合计约 54 G）：
+**已入库的乒乓球权重**（4 份，各 41 MB，合计 164 MB）。四个训练实验的 `model_best.pt` 全部随仓库提供，clone 下来即可推理：
+
+| 文件 | md5 前 8 位 | 训练实验 | 说明 |
+|---|---|---|---|
+| `TrackNet/TrackNet/exps/tt_g345_aug/model_best.pt` | `a496d256` | game3/4/5，带增强，约 16,300 帧 | **当前使用的一份**，与 2026-10-26 交付包内文件 md5 一致 |
+| `TrackNet/TrackNet/exps/tt_g45_aug/model_best.pt` | `dae24d10` | game4/5，带增强 | 中间版，报告里 `tt_g45_aug_*` 那批结果由它产出 |
+| `TrackNet/TrackNet/exps/tt_game4_aug/model_best.pt` | `bc0d0625` | game_4 单场，带增强 | 中间版 |
+| `TrackNet/TrackNet/exps/tt_game4_run/model_best.pt` | `fc8428b6` | game_4 单场 | 第一版 |
+
+四份架构完全相同（`BallTrackerNet`，10.72 M 参数，126 层），**`.pt` 加载不会报错，权重错了只会静默跑出坏结果**，认文件请对 md5。同一实验的 `model_last.pt`、`model_best_ep2.pt` 是中间态，未入库。
+
+**不在仓库里、但名字很像的两份**（用错不会报错）：
+
+| 路径 | 是什么 | 用途 |
+|---|---|---|
+| `TrackNet/TrackNet/weights/model_best.pt` | **上游 2023 年官方网球权重**，与 `datasets/raw/model_best.pt` 是同一个文件（md5 `3675ee22…`，42,886,919 B） | 迁移学习的起点，**不能**直接跑乒乓球 |
+| `TrackNet/TrackNet/weights/tt_game4_best.pt` | 是 `exps/tt_game4_run/model_best.pt` 的副本（md5 相同） | 早期单独拷出来的一份，已被 `exps/` 里的取代 |
+
+> `weights/` 这个目录名最容易误导：里面 **一份是上游网球权重、一份是自训乒乓球权重的副本**，只凭文件名分不出来。
+
+**仍然不进仓库的**（合计约 54 G，权重之外的其余大文件）：
 
 | 目录 / 文件 | 体积 | 说明 |
 |---|---|---|
 | `_data/` | 38 G | 原始比赛视频与标注，OpenTTGames 官方源可重新下载 |
 | `TrackNet/.venv/` | 7.6 G | `pip install -r requirements.txt` 重建 |
 | `TrackNet/TrackNet/datasets/` | 5.2 G | `prepare_openttgames.py` 从 `_data/` 生成 |
-| `outputs/` | 2.7 G | 运行产物，跑一遍就有 |
-| `TrackNet/TrackNet/exps/` | 410 M | 4 个实验共 10 份 `.pt`，训练时自动保存，**不可廉价重建**（见下） |
-| `TrackNet/TrackNet/weights/` | 82 M | 两份来源完全不同，见下表 |
+| `outputs/` | 2.7 G | 追踪视频与运行产物；**单个 mp4 就 1.9 G，超 GitHub 100 MB 硬限，技术上进不去** |
+| `TrackNet/TrackNet/exps/` 其余 | 246 M | `model_last.pt` ×4、`model_best_ep2.pt` ×2，同实验中间态 |
 | `backup/` | 250 M | 改动前的本地快照（旧代码 + 权重），仅作回滚用 |
 
-**几个同名的 `.pt` 别搞混。** 它们架构完全一致（`BallTrackerNet`，10.72 M 参数、126 层），**加载不会报错**，只会静默跑出错的结果：
-
-| 路径 | 来源 | 用途 |
-|---|---|---|
-| `TrackNet/TrackNet/weights/model_best.pt` | **上游 2023 年官方网球权重**，与 `datasets/raw/model_best.pt` 是同一个文件（md5 `3675ee22…`） | 迁移学习的起点，**不能**直接跑乒乓球 |
-| `TrackNet/TrackNet/weights/tt_game4_best.pt` | 自训，`tt_game4_run`（game_4 单场） | 第一版乒乓球权重，已被取代 |
-| `TrackNet/TrackNet/exps/tt_g345_aug/model_best.pt` | 自训，`tt_g345_aug`（game3/4/5 + 增强） | **当前使用的一份**，与 `outputs/2026-10-26/packages/` 交付包内同名文件 md5 一致（`a496d256…`） |
-
-> `weights/` 这个目录名容易误导：里面 **一份是上游网球权重、一份是自训乒乓球权重**，只凭文件名分不出来。用前先 `md5sum` 对一下。
-
-**为什么不放进 Git。** 两条，对所有大文件都成立：
+**为什么这些不放进 Git。** 两条，对所有大文件都成立：
 
 1. **单文件硬上限 100 MB。** GitHub 超过直接拒收（50 MB 起警告），一次 `push` 就被整条驳回。
 2. **Git 存的是快照，不是增量。** 对 `.pt` / `.mp4` / `.jpg` 这类二进制，git 既不能 delta 压缩也不能 diff，每提交一版就多一份完整副本；更糟的是**写进历史就删不掉**——`git rm` 只是让它在最新提交里消失，体积还在 `.git` 里，要真删得用 `filter-repo` 重写全部历史。
 
-**唯一的例外是自训权重**——它不能靠重跑廉价得到，确实需要分发。但分发方式同样不是提交，而是 Release：
+**权重是唯一的破例**，因为它不可重建（要 38 G 数据加完整训练），而 41 MB 未触到硬限，代价可控。这意味着**以后每换一版权重，仓库历史就多 41 MB 且无法回收**——所以只放 4 个实验的 best，不放 last 和中间 epoch。
 
-1. 仓库右侧 Releases → 新建 tag（如 `weights-2026-10-26`）→ 上传 `model_best.pt`；
-2. 单文件 41 MB，远低于 2 GiB 的附件上限，既不占仓库体积也不进历史；
-3. 多个版本可以并存（`tt_game4_run` / `tt_g45_aug` / `tt_g345_aug` 各一个 tag），不必互相覆盖。
+**视频和图**没法这么处理（单文件上 G），需要走 Release 附件或网盘；仓库里只留 `outputs/` 的体积清单和代表性截图。
 
-组内分发用 `outputs/2026-10-26/packages/` 里那两份 zip 更快；Release 的价值是让仓库自己说得清"哪份权重对应哪次结果"。
-
-> 上游仓库未附 LICENSE 文件，这里的代码仅用于课程项目。对外分发前要确认授权。
+> 上游仓库未附 LICENSE 文件，这里的代码仅用于课程项目。权重由 OpenTTGames 数据训练得到，公开分发前需确认该数据集的条款。
 
 ---
 
