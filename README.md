@@ -105,6 +105,9 @@ python tt/run_mixed.py \
 
 ### 4. 从视频重跑（完整链路）
 
+> **前置**：这一步需要两样仓库里没有的东西——待测视频（`_data/`）和模型权重（`exps/tt_g45_aug/model_best.pt`，41 MB），
+> 都按文末「与上游的关系」里「不进仓库的」说明另行获取。**只想验证链路是否通，用第 3 步的自包含 demo 就够**，不需要这些。
+
 ```bash
 # a) 推理 → Observation（要权重）
 cd TrackNet/TrackNet
@@ -200,7 +203,22 @@ python tt/run_mixed.py \
 | `calibrate_table.py` | 球台四角标定 | 新增 |
 | `gt_gen.py` / `main.py` / `datasets.py` / `general.py` / `test.py` | 乒乓球适配改造 | 修改 |
 
-**不进仓库的**：`datasets/`（5.2 G）、`exps/`（410 M 训练输出）、`weights/`（82 M）、`.venv/`（7.6 G）、`outputs/`（2.6 G）、`*.pt`。
+**不进仓库的**（合计约 54 G，全部可由仓库内的脚本或公开源重建）：
+
+| 目录 / 文件 | 体积 | 为什么可以排除 |
+|---|---|---|
+| `_data/` | 38 G | 原始比赛视频与标注，OpenTTGames 官方源可重新下载 |
+| `TrackNet/.venv/` | 7.6 G | `pip install -r requirements.txt` 重建 |
+| `TrackNet/TrackNet/datasets/` | 5.2 G | `prepare_openttgames.py` 从 `_data/` 生成 |
+| `outputs/` | 2.7 G | 运行产物，跑一遍就有 |
+| `TrackNet/TrackNet/exps/` | 410 M | 训练输出，重跑训练得到；权重单个 41 M |
+| `TrackNet/TrackNet/weights/`、`backup/`、`*.pt` | 82 M+ | 上游预训练权重可下载；`backup/` 是改动前的本地快照 |
+
+**为什么不放进 Git。** 三个原因，按严重程度排：
+
+1. **单文件硬上限 100 MB。** GitHub 超过直接拒收（50 MB 起警告），一次 `push` 就被整条驳回。
+2. **Git 存的是快照，不是增量。** 对 `.pt` / `.mp4` / `.jpg` 这类二进制，git 既不能 delta 压缩也不能 diff，每提交一版就多一份完整副本；更糟的是**写进历史就删不掉**——`git rm` 只是让它在最新提交里消失，体积还在 `.git` 里，要真删得用 `filter-repo` 重写全部历史。
+3. **这些文件都能重建。** 数据和权重都放在仓库外面（本地磁盘 / 官方源 / 网盘），仓库只放能生成它们的东西：脚本、参数、契约。代价是 clone 下来只占几 MB，而不是等 15 分钟。
 
 > 上游仓库未附 LICENSE 文件，这里的代码仅用于课程项目。对外分发前要确认授权。
 
