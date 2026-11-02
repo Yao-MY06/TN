@@ -26,6 +26,7 @@
 │   ├── eval_mot.py                 MOT 指标评估（py-motmetrics）
 │   └── examples/                   可跑通 demo 的样例数据
 ├── tt/                          状态机联调层
+│   ├── _unpacked/                 状态机交付件（原样入库，见「状态机交付件」）
 │   ├── run_mixed.py                混合事件源运行器（主力）
 │   ├── build_timeline.py           事件/判罚时间线 HTML
 │   ├── export_his_racket_hits.py   导出状态机轨迹层的击球事件
@@ -72,16 +73,15 @@ pip install -r requirements.txt
 
 模型推理另需 PyTorch，版本跟随显卡，不写死在这里。
 
-### 2. 取状态机交付件（**必需**）
+### 2. 状态机交付件（已随仓库提供，无需额外操作）
 
-`tt/` 依赖组长发的状态机包，本仓库不收录（第三方交付件，不分发）。
-
-```bash
-# 拿到 乒乓球裁判状态机_交付件.zip 之后：
-unzip 乒乓球裁判状态机_交付件.zip -d tt/_unpacked/
-```
+`tt/_unpacked/` 就是组长下发的 `乒乓球裁判状态机_交付件.zip` 解压后的**原样内容**，
+入库时与本机解压结果做过 `diff -r` 逐文件比对，**零差异**，一行未改。clone 下来即可直接跑。
 
 `run_mixed.py` 通过 `sys.path.insert(0, tt/_unpacked)` 导入 `core.*` 与 `visualizer.*`，不需要安装。
+
+> 原始 zip 没有一起入库——内容与 `tt/_unpacked/` 完全相同，避免同一份代码存两份拷贝后逐渐漂移。
+> 需要以 zip 为准覆盖时：`unzip -o 乒乓球裁判状态机_交付件.zip -d tt/_unpacked/`
 
 ### 3. 跑一段端到端（自包含，不用视频、不用权重）
 
@@ -156,9 +156,31 @@ python tt/run_mixed.py \
 | 擦网 `NET_TOUCH` 单目侧视不可分 | 物理限制 | 四个假设全部实测否定，暂不支持 |
 | 球飞出台外后模型彻底丢失（热图峰值 231→**0**，持续 2.84 s） | 模型能力边界 | 已定位，非阈值/分辨率问题；标注同样空白 |
 | 远端高球飞出（图像 y 递减）不出 `OUT` | 现有判据的理论缺口 | 两段视频暂无实锤案例 |
-| 状态机 `_unpacked` 不在本仓库 | 授权 / 分发限制 | 需向组长索取 |
 
 `confidence=null` 那条值得单独说：方案 §7.1 允许填 null，下游却拿它当门槛用。**这种问题只有把三方的约定放在一起才看得见，也是建这个仓库的主要理由。**
+
+---
+
+## 状态机交付件（`tt/_unpacked/`）
+
+判罚规则来自组长下发的 `乒乓球裁判状态机_交付件.zip`（2026-10-30 收）。已解压入库，**原样保留、一行未改**。
+
+| 项 | 值 |
+|---|---|
+| 位置 | `tt/_unpacked/`，13 个文件 / 318 KB |
+| 内容 | `core/`（几何、单应性、schema、状态机、轨迹层）、`visualizer/broadcast_hud.py`、`run_state_machine.py`，以及包内自带的 `README.md`、`requirements.txt`、`examples/` 样例数据 |
+| 完整性 | 入库时与本机 zip 解压结果 `diff -r` **零差异**；zip 的 SHA-256 为 `ba9f3b21…f9efcae` |
+| 版本 | 2026-10-30 版。内置预设为 game2 / rally / plos / test4 / test2，**不含 game_4**，片段的球台四角由我方在 `run_mixed.py` 里另加 |
+
+**为什么不改它。** 对外的四个干预——落台换源、注入延迟、出界推断、发球守卫——全在 `tt/run_mixed.py`，状态机文件未动。理由有三：对方能独立升级，我这层不用跟着改；判错时能立刻分清是规则问题还是检测问题；对方拿自己那份代码就能复现我的结果，不必先同步我的补丁。唯一伸进内部的操作是调用它自己的 `_reset_rally(keep_server=True)`（`core/state_machine.py:517`），属正常调用私有 API，不是打补丁。
+
+**`OUT` 不是新造的类型。** 状态机原生支持——`core/state_machine.py:421` 的 `_on_out()`，发球阶段判"发球出界"、对拉阶段判 `opponent(last_hitter)` 得分，判给谁由它算。外层只回答"什么时候算球出界"。
+
+**包内已知问题**（`confidence` 那条是契约级；完整 5 条见 [`tt/状态机联调评估.md`](tt/状态机联调评估.md) 第 7 节，均未改代码，而是绕开或提建议）：
+
+- `confidence=null` 被当成硬门限——`core/trajectory_processor.py:460`（默认值在 `:154`，`conf_new=0.35`）
+- `ball.predicted` 被 `from_dict` 静默丢弃，补帧点当真实检测用
+- HUD 发球指示与 `P1` 文字重叠成 `P1erve`（`visualizer/broadcast_hud.py:254`），外层用 `patch_scoreboard()` 绕开
 
 ---
 
@@ -208,9 +230,14 @@ python tt/run_mixed.py \
 根仓库无法跟踪另一个仓库里的文件，于是把两个 `.git` 移到了仓库外：
 
 ```text
-E:/bc/xm/ppq_git_backup_2026-11-02/TrackNet_outer.git   6.9 M
-E:/bc/xm/ppq_git_backup_2026-11-02/TrackNet_inner.git   6.9 M
+<本机仓库外的备份目录>/TrackNet_outer.git   6.9 M
+<本机仓库外的备份目录>/TrackNet_inner.git   6.9 M
 ```
 
 移出前确认过：两者都停在上游同一提交、**0 个本地提交、无 stash**，所以只断开 `git log` / `git diff` 的上游参照，不丢工作。
 需要恢复对比时，把备份目录改名回 `TrackNet/.git` 即可；确认不再需要可直接删除。
+
+**同日：把状态机交付件纳入本仓库。** `tt/_unpacked/` 原先在忽略列表里，靠组长单独发 zip。
+现在整目录入库（13 个文件、318 KB），clone 下来即可直接跑，不必再额外索取交付件。
+入库时做过 `diff -r` 校验，与 zip 解压结果零差异；原始 zip 不入库，避免同一份代码两份拷贝。
+详见上文「状态机交付件」一节。
