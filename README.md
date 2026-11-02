@@ -176,7 +176,7 @@ python tt/run_mixed.py \
 
 **`OUT` 不是新造的类型。** 状态机原生支持——`core/state_machine.py:421` 的 `_on_out()`，发球阶段判"发球出界"、对拉阶段判 `opponent(last_hitter)` 得分，判给谁由它算。外层只回答"什么时候算球出界"。
 
-**包内已知问题**（`confidence` 那条是契约级；完整 5 条见 [`tt/状态机联调评估.md`](tt/状态机联调评估.md) 第 7 节，均未改代码，而是绕开或提建议）：
+**包内已知问题**（`confidence` 那条是契约级；完整 5 条见 [`tt/状态机联调评估.md`](tt/状态机联调评估.md) 第五节「建议」，均未改代码，而是绕开或提建议）：
 
 - `confidence=null` 被当成硬门限——`core/trajectory_processor.py:460`（默认值在 `:154`，`conf_new=0.35`）
 - `ball.predicted` 被 `from_dict` 静默丢弃，补帧点当真实检测用
