@@ -23,8 +23,22 @@ EXAMPLES_DIR = os.path.join(TN_ROOT, "adapter", "examples")
 
 # 三个仓库并排放在同一个父目录下（ppq/TN、ppq/TTNet、ppq/pingpong-smart-referee）
 PPQ_ROOT = os.path.dirname(TN_ROOT)
-TTNET_ROOT = os.path.join(PPQ_ROOT, "TTNet")
-YOLO_ROOT = os.path.join(PPQ_ROOT, "pingpong-smart-referee")
+THIRD_PARTY = os.path.join(TN_ROOT, "third_party")
+
+
+def _first_existing(*cands):
+    for c in cands:
+        if os.path.isdir(c):
+            return c
+    return cands[0]
+
+
+# 优先用并排的独立仓库；没有时用本仓库 third_party/ 下的副本（fusion/three-way 分支自带）
+TTNET_ROOT = _first_existing(os.path.join(PPQ_ROOT, "TTNet"), os.path.join(PPQ_ROOT, "TTNet1.1"),
+                             os.path.join(THIRD_PARTY, "TTNet1.1"))
+TTNET11_ROOT = _first_existing(os.path.join(PPQ_ROOT, "TTNet1.1"), os.path.join(THIRD_PARTY, "TTNet1.1"))
+YOLO_ROOT = _first_existing(os.path.join(PPQ_ROOT, "pingpong-smart-referee"),
+                            os.path.join(THIRD_PARTY, "pingpong-smart-referee"))
 
 for _p in (SM_ROOT, TT_DIR, ADAPTER_DIR):
     if _p not in sys.path:

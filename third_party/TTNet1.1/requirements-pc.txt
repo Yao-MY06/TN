@@ -1,0 +1,14 @@
+# 目标 Python 3.11；先按 DEPLOY_NOTES.md 安装 CUDA 版 torch/torchvision。
+# 下列直接依赖版本来自基线环境的只读 dist-info 元数据；不是完整传递依赖锁文件。
+torch==2.6.0
+torchvision==0.21.0
+numpy==2.4.6
+opencv-python==5.0.0.93
+easydict==1.13
+scikit-learn==1.9.1
+tensorboard==2.21.0
+tqdm==4.70.1
+matplotlib==3.11.2
+Pillow==12.3.0
+# 仅 prepare_dataset/download_dataset.py 使用。
+wget==3.2

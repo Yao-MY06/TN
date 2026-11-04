@@ -1,0 +1,11 @@
+# ---- Git LFS：模型权重 ----
+# 只把「当前基线主力权重」纳入 LFS。其余权重体积大且非必需，
+# 继续留在本地（见 README 的「权重获取」一节）。
+checkpoints/ttnet_3rd_phase/ttnet.pth filter=lfs diff=lfs merge=lfs -text
+
+# ---- 文本文件统一用 LF，避免 Windows 下 CRLF 反复改动 ----
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf

@@ -17,13 +17,12 @@ import os
 import sys
 import types
 
-from ._paths import PPQ_ROOT  # noqa: F401  确保 core 可导入
+from ._paths import TTNET11_ROOT  # noqa: F401  确保 core 可导入
 
 import core.schemas as _schemas  # noqa: E402
 import core.state_machine as _sm  # noqa: E402
 
 CHOICES = ("tn", "ttnet11-yolo", "ttnet11-ttnet")
-TTNET11_ROOT = os.path.join(PPQ_ROOT, "TTNet1.1")
 
 
 def _load_ttnet11(root: str = TTNET11_ROOT):
