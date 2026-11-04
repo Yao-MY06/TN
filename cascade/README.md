@@ -64,6 +64,30 @@ W 的三个来源：尚未发出的提议（锚点 ≥ 当前帧 − 12 帧）�
 TrackNet 可见率只有 30.6% 的视频上触发很多。要等拿到 `events_markup.json` 后按提议召回率一起调，
 不能只为压覆盖率而调。另外重叠片段可以复用逐帧分数，TTNet 复核器接入时按"去重后的帧数"计窗口。
 
+## 用独立真值核对（Extended OpenTTGames）
+
+[moamal01/table_tennis_data](https://github.com/moamal01/table_tennis_data)（CC BY-NC-SA 4.0，arXiv:2512.19327）
+给 OpenTTGames 补了**击球**和**每分的结束方式**标注（不含落台）。文件放在 `_data/gt/extended_openttgames/`
+（`_data/` 不进 git），核对脚本：
+
+```bash
+python -m cascade.eval_extended --run-dir outputs/cascade/test_2_rule \
+    --game-json _data/gt/extended_openttgames/game_data/test/test_2.json
+```
+
+test_2 前 30 s 的结果：
+
+| 项 | 结果 |
+|---|---|
+| 每一分得分方 | **2/2 正确**：9.45 s `left_net` → 我方 9.675 s 判右方得分（`OWN_COURT`）；23.833 s `left_out` → 我方同一帧判右方得分（`OUT`） |
+| 击球召回 / 侧别 | **29/29**，侧别 29/29 |
+| 击球时间 | 系统性**偏晚 7–23 帧，中位 15 帧（125 ms）**；按 ±5 帧对称容差算 F1 为 0 |
+| 多出的击球 | 11 条全在第一分：10 条与标注的右方击球严格 A/B 交替，疑似标注漏了左方回球；9.817 s 一条在该分结束后，是真误报 |
+
+**击球滞后的影响**：轨迹层要等球重新出现、看到水平速度反向才报击球，而击球瞬间 TrackNet
+在 ±12 帧内多数只看到 0–3 帧球。`run_mixed` 的 0.07 s 注入延迟是按"滞后 0–17 ms"定的，
+实测约 125 ms，快速对拉里"落台排到击球前面"的风险比原先估计的大。这一条值得同步给状态机那边。
+
 ## 下一步
 
 1. 原机对 test_2 跑 YOLO 适配器（`pingpong-smart-referee/run_referee.py --video … --preset test2

@@ -171,5 +171,26 @@ class TestConfigVariants(unittest.TestCase):
         self.assertEqual(online, _offline_bounces())
 
 
+EXT_GT = os.path.join(TN_ROOT, "_data", "gt", "extended_openttgames", "game_data", "test", "test_2.json")
+
+
+@unittest.skipUnless(os.path.isfile(EXT_GT), "缺 Extended OpenTTGames 标注（_data/gt/extended_openttgames）")
+class TestExtendedGroundTruth(unittest.TestCase):
+    """独立真值：每一分的得分方必须正确，击球不得漏检。"""
+
+    def test_points_and_hits(self):
+        from cascade.eval_extended import evaluate, parse_game_json
+        from cascade.run_cascade import write_outputs
+        strokes, endings = parse_game_json(EXT_GT)
+        self.assertEqual((len(strokes), len(endings)), (29, 2))
+        with tempfile.TemporaryDirectory() as tmp:
+            write_outputs(tmp, run(OBS, preset="test2"))
+            r = evaluate(tmp, EXT_GT)
+        self.assertEqual(r["points"]["correct"], 2)
+        self.assertEqual(r["points"]["spurious_points"], [])
+        self.assertEqual(r["hits"]["lag_aware"]["r"], 1.0)
+        self.assertEqual(r["hits"]["lag_aware"]["side_agree"], "29/29")
+
+
 if __name__ == "__main__":
     unittest.main()

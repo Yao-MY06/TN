@@ -247,8 +247,12 @@ class StreamingReferee:
     def _record_decision(self, obs, t: float, d) -> None:
         text = d.describe()
         self.decisions.append(f"[{t:6.3f}s] {text}")
+        kind = getattr(d, "kind", None)
         self.decision_records.append({"virtual_t": round(t, 6), "real_t": round(self._now_t, 6),
-                                      "frame_id": obs.frame_id, "text": text})
+                                      "frame_id": obs.frame_id,
+                                      "kind": kind.value if hasattr(kind, "value") else kind,
+                                      "winner": getattr(d, "winner", None),
+                                      "rule": getattr(d, "rule", None), "text": text})
         self.log_lines.append(f"  [帧 {obs.frame_id:04d} | {t:6.3f}s] >> 判罚: {text}")
 
     # ------------------------------------------------------------------ 汇总
