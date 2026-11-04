@@ -50,13 +50,16 @@ class CommitConfig:
     serve_guard_lookback: float = 0.45
     serve_guard_max_hole: float = 0.08
     keep_inner_bounce: bool = False
+    # 计分状态机：tn（默认，与 run_mixed 一致）/ ttnet11-yolo / ttnet11-ttnet，见 state_machines.py
+    state_machine: str = "tn"
 
 
 class StreamingReferee:
     def __init__(self, calib, cfg: Optional[CommitConfig] = None) -> None:
         self.calib = calib
         self.cfg = cfg or CommitConfig()
-        self.sm = TableTennisStateMachine(MatchRules())
+        from .state_machines import make_state_machine
+        self.sm = make_state_machine(self.cfg.state_machine)
         self.source: Optional[rm.MixedEventSource] = None
         self.out_det = OnlineOutDetector(
             calib, self.cfg.out_min_px, self.cfg.out_gap_s, self.cfg.out_need_descending,

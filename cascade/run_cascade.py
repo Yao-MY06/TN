@@ -33,6 +33,7 @@ from cascade.frame_index import FrameIndex  # noqa: E402
 from cascade.proposals import ProposalGenerator, ProposalParams  # noqa: E402
 from cascade.reviewers import OracleReviewer, RuleReviewer  # noqa: E402
 from cascade.scheduler import ClipScheduler  # noqa: E402
+from cascade.ttnet_reviewer import add_ttnet_args, build_ttnet_reviewer  # noqa: E402
 
 import run_mixed as rm  # noqa: E402
 from core.schemas import FrameObservation  # noqa: E402
@@ -58,7 +59,7 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
         params: Optional[ProposalParams] = None, commit: Optional[CommitConfig] = None,
         review_latency_frames: int = 0, merge: bool = True, max_clip_s: float = 1.0,
         pre_ctx: int = 0, post_ctx: int = 0, session_id: str = "s01",
-        fps: float = 120.0) -> Dict[str, Any]:
+        fps: float = 120.0, ttnet_args: Any = None) -> Dict[str, Any]:
     params = params or ProposalParams()
     commit = commit or CommitConfig()
     db = load_detect_bounce()
@@ -78,6 +79,11 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
         if not oracle_events:
             raise SystemExit("--reviewer oracle 需要 --oracle-events")
         rev = OracleReviewer(_read_jsonl(oracle_events), max_lead_s=params.pre_s)
+    elif reviewer == "ttnet":
+        if ttnet_args is None:
+            raise SystemExit("--reviewer ttnet 需要 TTNet 参数（--ttnet-cache 或 --video + --ttnet-weights）")
+        evidence = list(raw) + (list(yolo.values()) if yolo else [])
+        rev = build_ttnet_reviewer(ttnet_args, poly, evidence, fps=fps, pre_s=params.pre_s)
     else:
         raise SystemExit(f"未知复核器: {reviewer}（TTNet 复核器在第 5 步接入）")
     ref = StreamingReferee(calib, commit)
@@ -166,10 +172,18 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
         "params": asdict(params), "commit": asdict(commit),
         "merge": merge, "max_clip_s": max_clip_s, "pre_ctx": pre_ctx, "post_ctx": post_ctx,
     }
+    if rev.name == "ttnet":
+        ms = sorted(rev.scores.infer_ms)
+        summary["ttnet"] = {
+            "backend": rev.scores.kind, "k": rev.k,
+            "windows_dedup": rev.n_windows,
+            "windows_dedup_ratio": round(rev.n_windows / max(1, len(raw)), 4),
+            "infer_ms_p50": _pct(ms, 0.5), "infer_ms_p95": _pct(ms, 0.95),
+        }
     if isinstance(rev, OracleReviewer):
         summary["oracle_missed"] = [round(e["timestamp_s"], 3) for e in rev.missed()]
     return {"summary": summary, "proposals": proposals, "clips": sched.submitted,
-            "results": results, "referee": ref}
+            "results": results, "referee": ref, "reviewer": rev}
 
 
 def write_outputs(out_dir: str, res: Dict[str, Any]) -> None:
@@ -185,6 +199,8 @@ def write_outputs(out_dir: str, res: Dict[str, Any]) -> None:
     dump("reviews.jsonl", [r.to_dict() for r in res["results"]])
     dump("events.jsonl", res["referee"].dumped_events)
     dump("decisions.jsonl", res["referee"].decision_records)
+    if getattr(res.get("reviewer"), "name", "") == "ttnet":
+        dump("ttnet_reviews.jsonl", res["reviewer"].log)
     with open(os.path.join(out_dir, "log.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(res["referee"].log_lines))
     with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
@@ -206,6 +222,10 @@ def print_summary(s: Dict[str, Any]) -> None:
           f"合并丢弃 {b['jitter_dropped']}")
     if s["out_events"]:
         print(f"出界            : {s['out_events']}")
+    if "ttnet" in s:
+        t = s["ttnet"]
+        print(f"TTNet           : {t['backend']}  k={t['k']}  去重窗口 {t['windows_dedup']} "
+              f"({t['windows_dedup_ratio'] * 100:.1f}%)  单窗 P50 {t['infer_ms_p50']} ms / P95 {t['infer_ms_p95']} ms")
     if "oracle_missed" in s:
         print(f"未被提议覆盖    : {len(s['oracle_missed'])} 条 {s['oracle_missed']}")
     lat = s["latency_s"]
@@ -230,13 +250,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--yolo", default=None, help="可选：同一视频的 YOLO 逐帧观测，用于分歧触发")
     ap.add_argument("--preset", default="test2")
     ap.add_argument("--quad", default=None, help="calib/table_quads.json 的键，默认由 preset 推出")
-    ap.add_argument("--reviewer", default="rule", choices=["rule", "oracle"])
+    ap.add_argument("--reviewer", default="rule", choices=["rule", "oracle", "ttnet"])
     ap.add_argument("--oracle-events", default=None)
     ap.add_argument("--review-latency-frames", type=int, default=0)
     ap.add_argument("--no-merge", action="store_true")
     ap.add_argument("--max-clip-s", type=float, default=1.0)
-    ap.add_argument("--pre-ctx", type=int, default=0, help="复核器在区间前需要的上下文帧（TTNet: 8-k）")
-    ap.add_argument("--post-ctx", type=int, default=0, help="复核器在区间后需要的上下文帧（TTNet: k）")
+    ap.add_argument("--pre-ctx", type=int, default=None,
+                    help="复核器在区间前需要的上下文帧；默认 TTNet 取 8-k，其他取 0")
+    ap.add_argument("--post-ctx", type=int, default=None,
+                    help="复核器在区间后需要的上下文帧；默认 TTNet 取 k，其他取 0")
     ap.add_argument("--pre-s", type=float, default=0.1)
     ap.add_argument("--post-s", type=float, default=0.1)
     ap.add_argument("--bounce-min-drop", type=float, default=8.0)
@@ -246,18 +268,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--dropout-min-frames", type=int, default=6)
     ap.add_argument("--no-jitter-merge", action="store_true")
     ap.add_argument("--no-out", action="store_true")
+    ap.add_argument("--state-machine", default="tn", choices=["tn", "ttnet11-yolo", "ttnet11-ttnet"],
+                    help="计分状态机：tn=TN 共用版（默认）；ttnet11-*=chagoup/TTNet1.1 的 TTNetStateMachine 两个档位")
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--quiet", action="store_true")
+    add_ttnet_args(ap)
     a = ap.parse_args(argv)
+    if a.pre_ctx is None:
+        a.pre_ctx = 8 - a.ttnet_k if a.reviewer == "ttnet" else 0
+    if a.post_ctx is None:
+        a.post_ctx = a.ttnet_k if a.reviewer == "ttnet" else 0
 
     params = ProposalParams(pre_s=a.pre_s, post_s=a.post_s, bounce_min_drop=a.bounce_min_drop,
                             table_margin_px=a.table_margin_px, hit_trigger=a.hit_trigger,
                             dropout_trigger=not a.no_dropout_trigger,
                             dropout_min_frames=a.dropout_min_frames)
-    commit = CommitConfig(jitter_merge=not a.no_jitter_merge, use_out=not a.no_out)
+    commit = CommitConfig(jitter_merge=not a.no_jitter_merge, use_out=not a.no_out,
+                          state_machine=a.state_machine)
     res = run(a.jsonl, a.preset, a.quad, a.reviewer, a.oracle_events, a.yolo, params, commit,
               a.review_latency_frames, merge=not a.no_merge, max_clip_s=a.max_clip_s,
-              pre_ctx=a.pre_ctx, post_ctx=a.post_ctx)
+              pre_ctx=a.pre_ctx, post_ctx=a.post_ctx,
+              ttnet_args=a if a.reviewer == "ttnet" else None)
     if not a.quiet:
         print_summary(res["summary"])
     if a.out_dir:

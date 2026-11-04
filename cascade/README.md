@@ -1,7 +1,9 @@
 # cascade/ — YOLO → TrackNet 提议 → TTNet 区间复核 级联层
 
-> 状态（2026-11-03）：第 1–2 步完成；第 4 步在 test_2 上完成（推断落台真值）。
-> TTNet 复核器尚未接入，当前用**规则复核器**（C3a）占位；YOLO 观测尚未生成。
+> 状态（2026-11-04）：第 1–2 步完成；第 4 步在 test_2 上完成（推断落台真值）。
+> 第 5 步代码完成：`--reviewer ttnet`（replay / live）已接入，备用权重 `ttnet.pth` 已验证可加载；
+> **还没有真实 TTNet 分数**，要等原机跑 `cascade/tools/run_machine_a.ps1`。YOLO 观测尚未生成。
+> 11-04：核对了 chagoup 自训权重（与备用权重不是同一份）；新增 `--state-machine` 可选 TTNet1.1 状态机（默认不变）。
 > 计划文档：《YOLO→TrackNet→TTNet 级联融合实施计划》
 
 只在外层包装：`tt/`、`adapter/`、`TrackNet/`、状态机交付件、另外两个仓库**一行未改**。
@@ -19,7 +21,7 @@ python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl
 python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl \
     --preset test2 --review-latency-frames 30
 
-# 回归测试（11 项，约 4 s）
+# 回归测试（44 项；没有 TTNet 权重时，需要权重的测试自动跳过）
 python -m unittest discover -s cascade/tests -t .
 ```
 
@@ -39,6 +41,12 @@ python -m unittest discover -s cascade/tests -t .
 | `committer.py` | 按事件时间提交：在滞后的虚拟时钟上原样执行 `run_mixed` 的主循环 |
 | `run_cascade.py` | 命令行入口与汇总 |
 | `eval_proposals.py` | 用 `events_markup.json` 算提议召回、漏提议明细、确认落台 P/R/F1（±5 / ±12 帧） |
+| `state_machines.py` | 计分状态机选择：`tn`（默认）或 TTNet1.1 的 `TTNetStateMachine` 两个档位 |
+| `ttnet_engine.py` | TTNet 单窗推理：`TorchEngine`（用 TTNet 仓库的 create_model，在外层兼容 CPU）/ `NumpyEngine`（不依赖 torch 的复刻，自带 .pth 读取） |
+| `ttnet_cache.py` | 视频 → 逐窗口 TTNet 分数 JSONL（原机用） |
+| `ttnet_reviewer.py` | `TTNetReviewer`：replay / live 两个后端，驼峰检测 + 印证判定 |
+| `ttnet_k_check.py` | 用真值核实事件对齐偏移 k |
+| `tools/run_machine_a.ps1` | 原机一键脚本 |
 
 ### 提交层为什么能保证"延迟不改判罚"
 
@@ -109,6 +117,22 @@ test_2 前 30 s 的结果：
 在 ±12 帧内多数只看到 0–3 帧球。`run_mixed` 的 0.07 s 注入延迟是按"滞后 0–17 ms"定的，
 实测约 125 ms，快速对拉里"落台排到击球前面"的风险比原先估计的大。这一条值得同步给状态机那边。
 
+## 计分状态机的选择（`--state-machine`）
+
+chagoup/TTNet1.1（放在 `ppq/TTNet1.1`）移植了同一套共用状态机，并以继承方式加了 TTNet 专属档位。
+它的 `yolo_sm/state_machine.py`、`schemas.py` 与 TN `core/` 逐字节相同（只差导入路径），所以 `state_machines.py`
+把它的导入映射到 TN 的 `core` 直接加载，不复制、不修改 TTNet1.1 的文件。
+
+| `--state-machine` | test_2 规则复核 | test_2 真值落台复核 |
+|---|---|---|
+| `tn`（默认） | 0:2，2/2 分正确 | 0:2，2/2 |
+| `ttnet11-yolo` | 与 `tn` 逐条相同（有单测） | 同左 |
+| `ttnet11-ttnet` | **0:6**，多判 4 个 `DOUBLE_BOUNCE` | **3:3**，多判 5 分、漏判 1 分 |
+
+`ttnet11-ttnet` 的"击球不清空落台侧"假设落台不漏：3.383 s 那次误判前，B 侧有一个 TrackNet 没看到的落台（真值 2.95 s），
+于是 2.508 s、3.383 s 两次 A 侧落台被当成连跳两次。这个档位是按 TTNet 自己的事件流调的，放进级联会多判分，
+所以默认仍用 `tn`，`ttnet11-*` 只作对照。
+
 ## 下一步
 
 1. **更多视频**（最要紧）：原机用 TrackNet 适配器跑 test_1、3–7 出观测 → 这几段都有落台与回合结束标注，
@@ -117,5 +141,94 @@ test_2 前 30 s 的结果：
    --export-jsonl …`，视频必须与 TrackNet 观测同一个文件）→ `--yolo` 打开分歧触发器。
 3. 拿到原版 `events_markup.json` 时，用它替换推断真值复跑一遍
    `python -m cascade.eval_proposals --run-dir <输出目录> --events-markup <json> --jsonl <TrackNet 观测>`。
-4. TTNet 到位 → `TTNetReviewer`（replay / live），`--pre-ctx 8-k --post-ctx k`。备用权重 `ttnet.pth`
-   可从 SLAM-TT 的 GitHub Release（v1.0.0）下载。
+4. TTNet 复核器已接入（见下节）。剩下的是在原机跑一键脚本，拿到真实分数并核实 k。
+
+## 第 5 步：TTNet 复核器
+
+### 备用权重（2026-11-03 在云端验证，没有 GPU、也装不上 torch）
+
+| 项 | 结果 |
+|---|---|
+| 来源 | SLAM-TT v1.0.0 Release 的 `ttnet.pth`，189,408,362 B，sha256 `370f1b667ee7717fcdb851df88801533665275abacd5fe9df2dba31a0d4ef6d9` |
+| 内容 | `ttnet_3rd_phase_epoch_30`，epoch 30 |
+| 键比对 | 用 TTNet 仓库自己的 `parse_configs` + `create_model`（借 torch 替身只枚举键名与形状）对照：226 / 226，missing 0、unexpected 0、形状不符 0（`BallDetection_right` 结构，键带 `model.` 前缀） |
+| 前向 (1,27,128,320) | numpy 引擎正常；2 核 CPU 约 0.5–0.6 s/窗（含分割约 0.75 s）。**torch 的 CPU/GPU 耗时未测**，看原机的 `_data/ttnet/test_2.jsonl.meta.json` |
+| 语义抽查 | 合成视频（暗背景上的白点）上，解码出的球位置与真实位置差 2–6 px：global→裁剪→local 链路复刻正确，也印证“球位置对应窗口末帧” |
+
+权重没有放进任何仓库或这台电脑；原机自备。
+
+### 规则
+
+- **k（事件对齐偏移）**：结束于第 e 帧的窗口，事件分数对应第 e−k 帧，默认 k=4。依据是训练代码
+  `get_events_infor`：9 帧窗口以 `smooth_idx` 为中心，事件标签峰在中间帧；球位置标签才取 `last_f_idx = smooth_idx + 4`。
+  chagoup 的适配器把事件绑在末帧，相当于 k=0。**必须用真值核实**：`ttnet_k_check.py` 在 k=0 下统计峰值相对最近真值的中位偏差，
+  它就是 k 的估计。`--reviewer ttnet` 默认 `--pre-ctx 8-k --post-ctx k`。
+- **驼峰**：bounce 上阈 0.65 / 下阈 0.55（chagoup `EventExtractor` 同规则），只在片段 [start_frame_id, end_frame_id] 内找；片段末尾未结束的驼峰也算。
+- **判定**：调度器标了 `missing_context` 或缓存缺窗口 → `error`；无驼峰 → `rejected`；
+  有驼峰，且峰值 ±5 帧内有 TrackNet/YOLO 真实检出（visible、非 predicted，取离峰值最近的一次，同距取较早）、
+  该点在台面多边形内、`detect_bounce.side_of` 为 A/B → `confirmed`，输出 BOUNCE（时间 = 峰值帧 / fps，sources `["ttnet", <印证来源>]`）；
+  否则 `uncertain`（原因 `no_detection_near_peak` / `off_table` / `side_unknown`）。
+- **net 分数**只记进 `ttnet_reviews.jsonl` 的 `net_cross`（上阈 0.5 / 下阈 0.4），**不生成 NET_TOUCH**。
+- **窗口去重**：同一次运行内按窗口末帧缓存，重叠片段复用分数。`summary.json` 的 `ttnet.windows_dedup` 是去重后的窗口数，
+  `clips.ttnet_windows` 仍是逐片段累计（未去重）。`ReviewResult.n_windows` 是该片段新算的窗口数。
+
+### 怎么跑
+
+```bash
+# replay（读原机产出的缓存）
+python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl --preset test2 \
+    --reviewer ttnet --ttnet-cache _data/ttnet/test_2.jsonl --ttnet-k 4 \
+    [--yolo _data/obs/yolo/test_2.jsonl] --out-dir outputs/cascade/test_2_ttnet
+
+# live（从视频现算；有 torch 用 torch，没有就用 numpy，约 0.5 s/窗）
+python -m cascade.run_cascade --jsonl ... --reviewer ttnet --video <test_2.mp4> \
+    --ttnet-weights <ttnet.pth> [--ttnet-src ../TTNet/src] [--ttnet-engine numpy] --ttnet-device cuda:0
+
+# 只生成缓存（原机）
+python -m cascade.ttnet_cache --video <test_2.mp4> --weights <ttnet.pth> --ttnet-src ../TTNet/src \
+    --engine torch --device cuda:0 --out _data/ttnet/test_2.jsonl
+
+# 核实 k
+python -m cascade.ttnet_k_check --ttnet-cache _data/ttnet/test_2.jsonl --gt \
+    _data/gt/extended_openttgames/inferred/test_2_events_markup_inferred.json --gt-end-frame 3226
+```
+
+`--out-dir` 下多一个 `ttnet_reviews.jsonl`（每个片段的驼峰、过网证据、原因码）。
+
+**原机一键脚本**（PowerShell，路径都是参数）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File cascade\tools\run_machine_a.ps1 `
+  -TNRoot E:\20-项目\ppq\TN -VideoDir <OpenTTGames 测试视频目录> `
+  -TTNetWeights <ttnet.pth> -TTNetSrc E:\20-项目\ppq\TTNet\src -Python <TN venv 的 python.exe>
+```
+
+依次做：自检（含权重 sha256）→ test_1、3–7 的 TrackNet 观测（在 `TrackNet/TrackNet` 下跑 `adapter/tracknet_adapter.py`，
+权重 `exps/tt_g345_aug/model_best.pt`）→ test_2 的 YOLO 导出 → test_2 的 TTNet 缓存，以及 torch 对 numpy 的一致性测试 →
+k 核实 → rule 和 ttnet 两组 run_cascade，每组接 eval_proposals 和 eval_extended，结果写到 `outputs/cascade_step5/`。
+TTNet 依赖与 TN 的 venv 冲突时加 `-TTNetPython <另一个 python.exe>`。各步可以用 `-Skip*` 跳过；已有输出默认不重跑，加 `-Force` 重跑。
+**这个脚本还没在 Windows 上实际跑过。**
+
+**新机位标定**：test_1、test_3–7 在 `calib/table_quads.json` 里还没有四角。脚本会对这些视频跑
+`calibrate_table.py export --frame 1200`，把带原图坐标网格的帧写到 `_data/calib/<game>_grid.jpg`。
+按 far_left、far_right、near_right、near_left 的顺序读出坐标，照 test_2 的格式写进 `calib/table_quads.json`，
+再用 `calibrate_table.py draw` 画回去核对。TrackNet 观测本身不需要四角，但提议、落台、侧别和复核都需要。
+
+### 已验证（没有真实 TTNet 分数时能验证的部分）
+
+- 规则复核路径不变：`--reviewer rule` 在 test_2 上仍是 0:2、3 条判罚。
+- 端到端冒烟：构造一份“理想 TTNet”缓存（在 28 个推断真值落台处放驼峰，k=4）走 `--reviewer ttnet`：
+  确认 26 / 28（另 2 个：一个附近没有 TrackNet 检出，判 uncertain；一个缺上下文，判 error），P 1.000 / R 0.929 / F1 0.963；
+  判罚仍是 0:2、3 条；去重窗口 1084（30.1%），逐片段累计 1109；`ttnet_k_check` 估出 k=4。
+- 合成视频上 replay 与 live 逐窗口分数差 ≤ 1e-3（numpy 引擎）。
+
+### 待核实
+
+1. **k**：用原机缓存跑 `ttnet_k_check`（一键脚本已包含）。
+2. **torch 单窗耗时**，以及 **torch 对 numpy 的一致性**（`tests/test_ttnet_weights.py`，需要设置 `TTNET_WEIGHTS` / `TTNET_SRC`）。
+3. ~~备用权重和 chagoup 资产包是否同一份~~ **已核对（11-04）：不是同一份。** chagoup 的自训权重
+   `ttnet_3rd_phase_epoch_30.pth`（放在 `ppq/` 根目录）sha256 `5e09137ece48f538a014c699744c8d45a225e39000c06c3efea3abe1951b6785`，
+   与备用权重 `370f1b…6d9` 大小相同、内容不同；TTNet1.1 仓库里 LFS 存的 `ttnet.pth` 就是备用权重那份。
+   自训权重在本机用 numpy 引擎加载、前向正常，`test_ttnet_weights` 的 replay/live 一致性通过（约 0.46 s/窗）；
+   torch 对 numpy 的一致性仍待原机验证（本机没有 torch）。chagoup 的 WEIGHT_COMPARE_REPORT 称两份效果几乎一致。
+4. **真实分数下的 C2 / C3 对照**：落台 F1 要不低于 C1 和 C2，重复计分为 0，TTNet 窗口调用数要低于全量。
