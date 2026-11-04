@@ -1,0 +1,270 @@
+"""级联回放运行器：观测 JSONL → 提议 → 调度 → 复核 → 按事件时间提交 → 状态机。
+
+逐帧流式处理（因果），"真实时刻"按视频帧时间计；``--review-latency-frames``
+模拟复核耗时。判罚应与延迟无关（见 committer.py 的说明），延迟只影响输出时刻。
+
+用法（在 TN 仓库根目录）::
+
+    python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl \\
+        --preset test2 --out-dir outputs/cascade/test_2_rule
+
+    # 已知事件当复核器（上限分析：提议漏检会损失多少）
+    python -m cascade.run_cascade --jsonl ... --reviewer oracle \\
+        --oracle-events adapter/examples/test_2_events.jsonl
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from collections import Counter
+from dataclasses import asdict
+from typing import Any, Dict, List, Optional
+
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    __package__ = "cascade"  # noqa: A001
+
+from cascade._paths import PRESET_TO_QUAD, load_detect_bounce  # noqa: E402
+from cascade.committer import CommitConfig, StreamingReferee  # noqa: E402
+from cascade.frame_index import FrameIndex  # noqa: E402
+from cascade.proposals import ProposalGenerator, ProposalParams  # noqa: E402
+from cascade.reviewers import OracleReviewer, RuleReviewer  # noqa: E402
+from cascade.scheduler import ClipScheduler  # noqa: E402
+
+import run_mixed as rm  # noqa: E402
+from core.schemas import FrameObservation  # noqa: E402
+from observation import load_observations  # noqa: E402
+
+
+def _pct(vals: List[float], q: float) -> Optional[float]:
+    if not vals:
+        return None
+    s = sorted(vals)
+    k = min(len(s) - 1, max(0, int(round(q * (len(s) - 1)))))
+    return s[k]
+
+
+def _read_jsonl(path: str) -> List[Dict[str, Any]]:
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
+        reviewer: str = "rule", oracle_events: Optional[str] = None,
+        yolo_jsonl: Optional[str] = None,
+        params: Optional[ProposalParams] = None, commit: Optional[CommitConfig] = None,
+        review_latency_frames: int = 0, merge: bool = True, max_clip_s: float = 1.0,
+        pre_ctx: int = 0, post_ctx: int = 0, session_id: str = "s01",
+        fps: float = 120.0) -> Dict[str, Any]:
+    params = params or ProposalParams()
+    commit = commit or CommitConfig()
+    db = load_detect_bounce()
+    poly = db.load_quad(quad or PRESET_TO_QUAD.get(preset, preset))
+    calib = rm.build_calib(preset)
+
+    raw = load_observations(jsonl)
+    yolo = {d["frame_id"]: d for d in load_observations(yolo_jsonl)} if yolo_jsonl else None
+
+    index = FrameIndex()
+    gen = ProposalGenerator(poly, index, params, session_id)
+    sched = ClipScheduler(index, pre_ctx, post_ctx, merge=merge, max_clip_s=max_clip_s,
+                          session_id=session_id)
+    if reviewer == "rule":
+        rev = RuleReviewer(poly, fps=fps)
+    elif reviewer == "oracle":
+        if not oracle_events:
+            raise SystemExit("--reviewer oracle 需要 --oracle-events")
+        rev = OracleReviewer(_read_jsonl(oracle_events), max_lead_s=params.pre_s)
+    else:
+        raise SystemExit(f"未知复核器: {reviewer}（TTNet 复核器在第 5 步接入）")
+    ref = StreamingReferee(calib, commit)
+
+    proposals, results = [], []
+    inflight: List[tuple] = []           # (到期位置, clip, result)
+
+    def earliest_event_t(c) -> float:
+        a = min(p.anchor_timestamp_s for p in c.proposals) - rev.max_lead_s
+        return max(c.start_timestamp_s, a)
+
+    def deliver(pos: int, force: bool = False) -> None:
+        while inflight and (force or inflight[0][0] <= pos):
+            _, c, r = inflight.pop(0)
+            r.completed_frame_id = index.last_frame_id
+            results.append(r)
+            ref.add_bounces(r.events)
+
+    def bounce_unknown_before() -> float:
+        w = gen.min_future_anchor_t() - rev.max_lead_s
+        for c in sched.open_clips():
+            w = min(w, earliest_event_t(c))
+        for _, c, _ in inflight:
+            w = min(w, earliest_event_t(c))
+        return w
+
+    for pos, d in enumerate(raw):
+        fid, ts = int(d["frame_id"]), float(d["timestamp_s"])
+        index.add(fid, ts)
+        ref.push_frame(FrameObservation.from_dict(d))
+        b = d["ball"]
+        txy = tuple(b["center_px"]) if b["visible"] and not b.get("predicted", False) else None
+        yxy, ygiven = None, False
+        if yolo is not None:
+            yd = yolo.get(fid)
+            ygiven = yd is not None
+            if yd is not None and yd["ball"]["visible"]:
+                yxy = tuple(yd["ball"]["center_px"])
+        new = gen.update(fid, ts, txy, yxy, ygiven)
+        proposals.extend(new)
+        sched.add(new)
+        for c in sched.poll(gen.min_future_anchor_t() - params.pre_s):
+            inflight.append((pos + review_latency_frames, c, rev.review(c)))
+        deliver(pos)
+        ref.advance(bounce_unknown_before())
+
+    tail = gen.flush()
+    proposals.extend(tail)
+    sched.add(tail)
+    for c in sched.poll(float("inf"), final=True):
+        inflight.append((len(raw), c, rev.review(c)))
+    deliver(len(raw), force=True)
+    ref.finish()
+
+    # ---------------------------------------------------------------- 汇总
+    t0, t1 = index.first_timestamp or 0.0, index.last_timestamp or 0.0
+    rel_lag = [real - evt for _, evt, real in ref.release_lag]
+    dec_lag = [r["real_t"] - r["virtual_t"] for r in ref.decision_records]
+    reasons = Counter(r for p in proposals for r in p.reasons)
+    summary = {
+        "input": os.path.basename(jsonl), "preset": preset, "reviewer": rev.name,
+        "frames": len(raw), "duration_s": round(t1 - t0, 3),
+        "score": {"A": ref.score[0], "B": ref.score[1]},
+        "decisions": ref.decisions,
+        "event_counts": dict(ref.counts),
+        "source_stats": dict(ref.source.stats) if ref.source else {},
+        "proposals": {"total": len(proposals), "by_reason": dict(reasons),
+                      "generator_stats": gen.stats},
+        "clips": {"total": len(sched.submitted), **sched.stats,
+                  "coverage": round(sched.coverage(t0, t1), 4),
+                  "ttnet_windows": sched.total_windows(),
+                  "ttnet_window_ratio": round(sched.total_windows() / max(1, len(raw)), 4)},
+        "reviews": dict(Counter(r.status for r in results)),
+        "bounces": {"confirmed": sum(len(r.events) for r in results),
+                    "kept_after_jitter": len(ref.kept_bounces),
+                    "jitter_dropped": [round(e.timestamp_s, 3) for e in ref.jitter_dropped]},
+        "out_events": [{"t": round(e.timestamp_s, 3), "side": e.side} for e in ref.out_events],
+        "latency_s": {
+            "event_release_p50": _pct(rel_lag, 0.5), "event_release_p95": _pct(rel_lag, 0.95),
+            "event_release_max": max(rel_lag) if rel_lag else None,
+            "decision_p50": _pct(dec_lag, 0.5), "decision_p95": _pct(dec_lag, 0.95),
+            "review_latency_frames": review_latency_frames,
+        },
+        "n_lowconf_masked": ref.n_lowconf,
+        "serve_guard_suppressed": [round(ev.timestamp_s, 3) for ev, _ in (ref.source.suppressed_serve if ref.source else [])],
+        "params": asdict(params), "commit": asdict(commit),
+        "merge": merge, "max_clip_s": max_clip_s, "pre_ctx": pre_ctx, "post_ctx": post_ctx,
+    }
+    if isinstance(rev, OracleReviewer):
+        summary["oracle_missed"] = [round(e["timestamp_s"], 3) for e in rev.missed()]
+    return {"summary": summary, "proposals": proposals, "clips": sched.submitted,
+            "results": results, "referee": ref}
+
+
+def write_outputs(out_dir: str, res: Dict[str, Any]) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+
+    def dump(name, rows):
+        with open(os.path.join(out_dir, name), "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    dump("proposals.jsonl", [p.to_dict() for p in res["proposals"]])
+    dump("clips.jsonl", [c.to_dict() for c in res["clips"]])
+    dump("reviews.jsonl", [r.to_dict() for r in res["results"]])
+    dump("events.jsonl", res["referee"].dumped_events)
+    dump("decisions.jsonl", res["referee"].decision_records)
+    with open(os.path.join(out_dir, "log.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(res["referee"].log_lines))
+    with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump(res["summary"], f, ensure_ascii=False, indent=2)
+
+
+def print_summary(s: Dict[str, Any]) -> None:
+    line = "=" * 74
+    print(line)
+    print(f"【级联回放】{s['input']}  预设 {s['preset']}  复核器 {s['reviewer']}")
+    print(line)
+    p, c = s["proposals"], s["clips"]
+    print(f"提议            : {p['total']} 条  {p['by_reason']}")
+    print(f"复核片段        : {c['total']} 个  覆盖时长 {c['coverage'] * 100:.1f}%  "
+          f"TTNet 窗口 {c['ttnet_windows']} / {s['frames']} 帧 ({c['ttnet_window_ratio'] * 100:.1f}%)")
+    print(f"复核结果        : {s['reviews']}")
+    b = s["bounces"]
+    print(f"落台            : 确认 {b['confirmed']}，抖动合并后 {b['kept_after_jitter']}，"
+          f"合并丢弃 {b['jitter_dropped']}")
+    if s["out_events"]:
+        print(f"出界            : {s['out_events']}")
+    if "oracle_missed" in s:
+        print(f"未被提议覆盖    : {len(s['oracle_missed'])} 条 {s['oracle_missed']}")
+    lat = s["latency_s"]
+    fmt = lambda v: "-" if v is None else f"{v:.3f}s"  # noqa: E731
+    print(f"提交延迟        : 事件 P50 {fmt(lat['event_release_p50'])} / P95 {fmt(lat['event_release_p95'])}；"
+          f"判罚 P50 {fmt(lat['decision_p50'])} / P95 {fmt(lat['decision_p95'])}"
+          f"（复核模拟耗时 {lat['review_latency_frames']} 帧）")
+    print(f"事件统计        : {s['event_counts']}")
+    print(f"事件源统计      : {s['source_stats']}")
+    if s["serve_guard_suppressed"]:
+        print(f"发球守卫拦截    : {s['serve_guard_suppressed']}")
+    print(f"最终比分        : P1(A) {s['score']['A']} : {s['score']['B']} P2(B)")
+    print(f"判罚条数        : {len(s['decisions'])}")
+    for d in s["decisions"]:
+        print(f"   - {d}")
+    print(line)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description="YOLO → TrackNet 提议 → 复核 → 状态机 级联回放")
+    ap.add_argument("--jsonl", required=True, help="TrackNet 逐帧观测（§7.1）")
+    ap.add_argument("--yolo", default=None, help="可选：同一视频的 YOLO 逐帧观测，用于分歧触发")
+    ap.add_argument("--preset", default="test2")
+    ap.add_argument("--quad", default=None, help="calib/table_quads.json 的键，默认由 preset 推出")
+    ap.add_argument("--reviewer", default="rule", choices=["rule", "oracle"])
+    ap.add_argument("--oracle-events", default=None)
+    ap.add_argument("--review-latency-frames", type=int, default=0)
+    ap.add_argument("--no-merge", action="store_true")
+    ap.add_argument("--max-clip-s", type=float, default=1.0)
+    ap.add_argument("--pre-ctx", type=int, default=0, help="复核器在区间前需要的上下文帧（TTNet: 8-k）")
+    ap.add_argument("--post-ctx", type=int, default=0, help="复核器在区间后需要的上下文帧（TTNet: k）")
+    ap.add_argument("--pre-s", type=float, default=0.2)
+    ap.add_argument("--post-s", type=float, default=0.3)
+    ap.add_argument("--bounce-min-drop", type=float, default=8.0)
+    ap.add_argument("--table-margin-px", type=float, default=30.0)
+    ap.add_argument("--no-hit-trigger", action="store_true")
+    ap.add_argument("--no-dropout-trigger", action="store_true")
+    ap.add_argument("--dropout-min-frames", type=int, default=6)
+    ap.add_argument("--no-jitter-merge", action="store_true")
+    ap.add_argument("--no-out", action="store_true")
+    ap.add_argument("--out-dir", default=None)
+    ap.add_argument("--quiet", action="store_true")
+    a = ap.parse_args(argv)
+
+    params = ProposalParams(pre_s=a.pre_s, post_s=a.post_s, bounce_min_drop=a.bounce_min_drop,
+                            table_margin_px=a.table_margin_px, hit_trigger=not a.no_hit_trigger,
+                            dropout_trigger=not a.no_dropout_trigger,
+                            dropout_min_frames=a.dropout_min_frames)
+    commit = CommitConfig(jitter_merge=not a.no_jitter_merge, use_out=not a.no_out)
+    res = run(a.jsonl, a.preset, a.quad, a.reviewer, a.oracle_events, a.yolo, params, commit,
+              a.review_latency_frames, merge=not a.no_merge, max_clip_s=a.max_clip_s,
+              pre_ctx=a.pre_ctx, post_ctx=a.post_ctx)
+    if not a.quiet:
+        print_summary(res["summary"])
+    if a.out_dir:
+        write_outputs(a.out_dir, res)
+        print(f"输出已写入: {a.out_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
