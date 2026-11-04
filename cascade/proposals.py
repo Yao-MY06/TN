@@ -47,11 +47,15 @@ class Proposal:
 class ProposalParams:
     win: int = 12                     # 局部极大判定窗（帧），与 detect_bounce 默认一致
     fps: float = 120.0                # 只用于把帧差换算成 px/s，与 detect_bounce 一致
-    pre_s: float = 0.2                # 区间 [t0 - pre, t0 + post]，方案初值
-    post_s: float = 0.3
+    # 区间 [t0 - pre, t0 + post]。方案初值 0.2 / 0.3 覆盖了 62% 的视频；在 test_2（推断真值，
+    # 28 个落台）上扫描后取 0.1 / 0.1：落台仍全部覆盖且距片段边缘 >= 6 帧，覆盖降到 30%。
+    # 只在一段视频上定的，换视频要复核（见 README「第 4 步」）。
+    pre_s: float = 0.1
+    post_s: float = 0.1
     table_margin_px: float = 30.0     # 台面多边形外扩（宽松）
     bounce_min_drop: float = 8.0      # 落差（宽松；离线严格版是 15）
-    hit_trigger: bool = True
+    # 方向突变：test_2 上没有带来任何落台召回，只增加覆盖，默认关
+    hit_trigger: bool = False
     hit_min_vx: float = 300.0         # 水平速度反号且任一侧 |vx| >= 该值（px/s）
     dropout_trigger: bool = True
     dropout_min_frames: int = 6       # 台面附近连续丢球多少帧

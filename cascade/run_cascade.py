@@ -237,11 +237,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--max-clip-s", type=float, default=1.0)
     ap.add_argument("--pre-ctx", type=int, default=0, help="复核器在区间前需要的上下文帧（TTNet: 8-k）")
     ap.add_argument("--post-ctx", type=int, default=0, help="复核器在区间后需要的上下文帧（TTNet: k）")
-    ap.add_argument("--pre-s", type=float, default=0.2)
-    ap.add_argument("--post-s", type=float, default=0.3)
+    ap.add_argument("--pre-s", type=float, default=0.1)
+    ap.add_argument("--post-s", type=float, default=0.1)
     ap.add_argument("--bounce-min-drop", type=float, default=8.0)
     ap.add_argument("--table-margin-px", type=float, default=30.0)
-    ap.add_argument("--no-hit-trigger", action="store_true")
+    ap.add_argument("--hit-trigger", action="store_true", help="打开方向突变触发器（默认关）")
     ap.add_argument("--no-dropout-trigger", action="store_true")
     ap.add_argument("--dropout-min-frames", type=int, default=6)
     ap.add_argument("--no-jitter-merge", action="store_true")
@@ -251,7 +251,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     a = ap.parse_args(argv)
 
     params = ProposalParams(pre_s=a.pre_s, post_s=a.post_s, bounce_min_drop=a.bounce_min_drop,
-                            table_margin_px=a.table_margin_px, hit_trigger=not a.no_hit_trigger,
+                            table_margin_px=a.table_margin_px, hit_trigger=a.hit_trigger,
                             dropout_trigger=not a.no_dropout_trigger,
                             dropout_min_frames=a.dropout_min_frames)
     commit = CommitConfig(jitter_merge=not a.no_jitter_merge, use_out=not a.no_out)

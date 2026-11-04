@@ -192,5 +192,41 @@ class TestExtendedGroundTruth(unittest.TestCase):
         self.assertEqual(r["hits"]["lag_aware"]["side_agree"], "29/29")
 
 
+EXT_ROOT = os.path.join(TN_ROOT, "_data", "gt", "extended_openttgames")
+T2_BALL = os.path.join(EXT_ROOT, "ball_data", "test", "test_2.json")
+
+
+@unittest.skipUnless(os.path.isfile(T2_BALL), "缺 Extended OpenTTGames 球位置标注")
+class TestInferredBounceGroundTruth(unittest.TestCase):
+    """推断真值的可靠性，以及默认提议参数下的落台召回。"""
+
+    def test_inference_rule_on_six_videos(self):
+        from cascade.infer_markup import validate
+        t = validate(EXT_ROOT)["total"]
+        self.assertEqual(t["found"], t["gt"])                 # 370/370 逐帧找回
+        self.assertGreaterEqual(t["typed_ok"] / t["typed"], 0.97)
+
+    def test_inferred_test2_matches_tn_report(self):
+        """推断真值复现 TN 报告的 0.774（34 条，全片口径）。"""
+        from cascade.eval_proposals import match
+        from cascade.infer_markup import infer, load_ball
+        inf = infer(load_ball(T2_BALL), 929.0)
+        gt = sorted(f for f, v in inf.items() if v == "bounce")
+        self.assertEqual(len(gt), 28)
+        with open(EVENTS, encoding="utf-8") as f:
+            pred = [round(json.loads(line)["timestamp_s"] * 120) for line in f if line.strip()]
+        self.assertAlmostEqual(match(pred, gt, 5)["f1"], 0.7742, places=4)
+
+    def test_default_proposals_cover_all_bounces_with_margin(self):
+        from cascade.infer_markup import infer, load_ball
+        inf = infer(load_ball(T2_BALL), 929.0)
+        gt = [f for f, v in inf.items() if v == "bounce"]
+        res = run(OBS, preset="test2")
+        clips = res["clips"]
+        for g in gt:
+            self.assertTrue(any(c.start_frame_id + 6 <= g <= c.end_frame_id - 6 for c in clips), g)
+        self.assertLess(res["summary"]["clips"]["coverage"], 0.40)
+
+
 if __name__ == "__main__":
     unittest.main()
