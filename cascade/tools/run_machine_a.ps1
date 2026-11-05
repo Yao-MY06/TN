@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   第 5 步一键脚本：在原机（有 GPU 和 OpenTTGames 测试视频）上产出级联需要的全部缓存，
   再用 replay 模式跑级联与评估。
@@ -15,6 +15,13 @@
     4. replay：run_cascade（--reviewer ttnet）、eval_proposals、eval_extended
        → outputs\cascade_step5\
   任何一步失败都会停下并打印原因；已存在的输出默认跳过（-Force 重跑）。
+
+.NOTES
+  依赖（装进 TN 的 venv，**不要让 pip 动 torch**）：
+    pip install easydict scikit-learn
+    pip install --no-deps ultralytics            # 不加 --no-deps 会连带把 torch 换成 CPU 版
+    然后按报错补齐 ultralytics 的纯 Python 依赖（同样不要升级 torch / torchvision）。
+  本文件带 UTF-8 BOM：Windows PowerShell 5.1 对无 BOM 的 UTF-8 会按 GBK 读，中文乱码导致语法错误。
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File cascade\tools\run_machine_a.ps1 `
@@ -80,7 +87,7 @@ try {
         if (-not (Test-Path $p)) { throw "路径不存在：$p" }
     }
     Run $Python @("-c", "import torch,cv2,numpy;print('torch',torch.__version__,'cuda',torch.cuda.is_available())") $TNRoot
-    Run $TTNetPython @("-c", "import torch,easydict;print('ttnet env ok, cuda',torch.cuda.is_available())") $TNRoot
+    Run $TTNetPython @("-c", "import torch,easydict,sklearn;print('ttnet env ok, cuda',torch.cuda.is_available())") $TNRoot
     $sha = (Get-FileHash $TTNetWeights -Algorithm SHA256).Hash.ToLower()
     Write-Host "TTNet 权重 sha256 = $sha"
     if ($sha -eq "370f1b667ee7717fcdb851df88801533665275abacd5fe9df2dba31a0d4ef6d9") {
@@ -173,7 +180,11 @@ try {
             $rd = Join-Path $OutDir $r.name
             Run $Python (@("-m", "cascade.run_cascade", "--jsonl", $tnObs, "--preset", "test2", "--out-dir", $rd) + $yoloArg + $r.extra) $TNRoot
             Run $Python @("-m", "cascade.eval_proposals", "--run-dir", $rd, "--events-markup", $gtMarkup, "--jsonl", $tnObs) $TNRoot
-            Run $Python @("-m", "cascade.eval_extended", "--run-dir", $rd, "--game-json", $gameJson) $TNRoot
+            if (Test-Path $gameJson) {
+                Run $Python @("-m", "cascade.eval_extended", "--run-dir", $rd, "--game-json", $gameJson) $TNRoot
+            } else {
+                Warn "缺 Extended OpenTTGames 标注 $gameJson，跳过 eval_extended（可把这台电脑上的 run 目录拷回有标注的电脑再跑）"
+            }
         }
         Write-Host "k 核实结果：$(Join-Path $OutDir 'k_check_test_2.json')。若 k_estimate 不是 $TTNetK，用 -TTNetK <新值> -SkipTrackNet -SkipYolo -SkipTTNet 重跑本步。"
     }
