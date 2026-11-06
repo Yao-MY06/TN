@@ -171,6 +171,16 @@ class TestConfigVariants(unittest.TestCase):
         self.assertEqual(online, _offline_bounces())
 
 
+class TestQuadCalibration(unittest.TestCase):
+    def test_game4_from_quad_matches_run_mixed(self):
+        from cascade.calib import build_calib_from_quad
+        self.assertEqual(build_calib_from_quad("game_4"), rm.build_calib("game4"))
+
+    def test_preset_alias_is_accepted(self):
+        from cascade.calib import build_calib_from_quad
+        self.assertEqual(build_calib_from_quad("game4"), rm.build_calib("game4"))
+
+
 EXT_GT = os.path.join(TN_ROOT, "_data", "gt", "extended_openttgames", "game_data", "test", "test_2.json")
 
 
