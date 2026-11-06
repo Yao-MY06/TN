@@ -1,5 +1,5 @@
 {
-  "_comment": "球台台面四角标定（原图 1920x1080 坐标）。顺序：far_left, far_right, near_right, near_left 顺时针。game_4 由台面蓝色区域颜色分割自动拟合（5 帧交叉验证，角点抖动 <5px）；test_2 因左右半台光照不均，颜色分割只截到右半台，改用放大裁切目视标定。",
+  "_comment": "球台台面四角标定（原图 1920x1080 坐标）。顺序：far_left, far_right, near_right, near_left 顺时针。game_4 由台面蓝色区域颜色分割自动拟合（5 帧交叉验证，角点抖动 <5px）；test_2 因左右半台光照不均，颜色分割只截到右半台，改用放大裁切目视标定。 test_1、test_3～7 由原机按台面白边与蓝色区域边界自动拟合后画回原图目视核对（2026-11-06），本机按角点放大图复核。",
   "game_4": {
     "points": [[531, 613], [1267, 614], [1406, 773], [406, 787]],
     "method": "auto_color_segment",
@@ -9,5 +9,49 @@
     "points": [[540, 516], [1330, 532], [1484, 656], [352, 631]],
     "method": "manual_zoom",
     "verified_frames": [1200]
+  },
+  "test_1": {
+    "points": [[522, 541], [1278, 569], [1377, 700], [282, 659]],
+    "method": "auto_bright_edge",
+    "verified_frames": [300, 1200, 4000, 8000, 12000, 16000],
+    "check_frame": 1200,
+    "confidence": "high"
+  },
+  "test_3": {
+    "points": [[561, 516], [1334, 532], [1480, 660], [357, 636]],
+    "method": "auto_bright_edge",
+    "verified_frames": [300, 1200, 2400, 3600, 4800, 6000],
+    "check_frame": 1200,
+    "confidence": "high"
+  },
+  "test_4": {
+    "points": [[518, 630], [1275, 631], [1441, 744], [351, 746]],
+    "method": "auto_bright_edge",
+    "verified_frames": [300, 1200, 4000, 8000, 16000, 24000],
+    "check_frame": 1200,
+    "confidence": "high"
+  },
+  "test_5": {
+    "points": [[537, 624], [1295, 624], [1461, 737], [372, 741]],
+    "method": "auto_bright_edge",
+    "verified_frames": [300, 3000, 5000, 7000],
+    "check_frame": 300,
+    "confidence": "high",
+    "note": "第 1200 帧右侧被球员遮挡，右半边点偏离；已排除该帧，核对图取第 300 帧"
+  },
+  "test_6": {
+    "points": [[624, 619], [1378, 639], [1540, 757], [457, 728]],
+    "method": "auto_bright_edge",
+    "verified_frames": [300, 1200, 4000, 7000, 10000],
+    "check_frame": 4000,
+    "confidence": "medium",
+    "note": "右侧球员靠近台面，右侧两点在部分帧被遮挡，逐帧抖动较大（far_right 6.8px / near_right 25.7px）；取中位值，目视核对通过"
+  },
+  "test_7": {
+    "points": [[545, 469], [1286, 462], [1446, 638], [404, 659]],
+    "method": "auto_bright_edge",
+    "verified_frames": [300, 1200, 4000, 8000, 12000, 15000],
+    "check_frame": 1200,
+    "confidence": "high"
   }
 }
