@@ -312,3 +312,35 @@ TTNet 依赖与 TN 的 venv 冲突时加 `-TTNetPython <另一个 python.exe>`�
    自训权重在本机用 numpy 引擎加载、前向正常，`test_ttnet_weights` 的 replay/live 一致性通过（约 0.46 s/窗）；
    torch 对 numpy 的一致性仍待原机验证（本机没有 torch）。chagoup 的 WEIGHT_COMPARE_REPORT 称两份效果几乎一致。
 4. **真实分数下的 C2 / C3 对照**：落台 F1 要不低于 C1 和 C2，重复计分为 0，TTNet 窗口调用数要低于全量。
+
+## YOLO 主跟踪（`--primary yolo`）
+
+按 YOLO（实时）→ TrackNet（实时提议）→ TTNet（区间检测）的顺序，最前面一层换成 YOLO：
+
+- 每帧先用 YOLO 的球位置（置信度 ≥ 0.5，且前后 2 帧内有位置连得上的 YOLO 检出，否则视为误检）。
+- YOLO 没给出可用的球、并且最近 60 帧内见过球（回合进行中）时，才调用 TrackNet 补这一帧；
+  长时间没见到球 = 不在回合中，TrackNet 不跑。`--fill-window-frames -1` 表示 YOLO 一丢就调。
+- 融合后的观测流交给原来的提议层；区间调度、TTNet 复核、状态机不变。YOLO 已是主轨迹，
+  “YOLO/TrackNet 分歧”触发器不再使用。连续性门限要看后 2 帧，融合流晚 2 帧（17 ms）。
+- 代码在 `fuse_obs.py`，`summary.json` 的 `fusion` 字段给出 TrackNet 调用比例等统计。
+- 批量清单里给视频加 `"primary": "yolo"`（需要 `yolo` 观测）。
+
+```bash
+python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl \
+    --yolo _data/obs/yolo/test_2.jsonl --primary yolo --preset test2 \
+    --reviewer ttnet --ttnet-cache _data/ttnet/test_2.jsonl --out-dir outputs/fusion_yolo/yolo_ttnet
+```
+
+test_2（调参视频，2026-11-07）：
+
+| 主跟踪 | 复核 | 落台 P / R / F1 | 得分方判对 | TrackNet 调用帧 |
+|---|---|---|---|---|
+| TrackNet | 规则 | 0.828 / 0.857 / 0.842 | 2/2 | 100% |
+| TrackNet | TTNet | 0.794 / 0.964 / 0.871 | 2/2 | 100% |
+| YOLO | 规则 | 0.824 / 1.000 / 0.903 | 1/2 | 27% |
+| YOLO | TTNet | 0.800 / 1.000 / 0.889 | 1/2 | 27% |
+| 仅 YOLO（不补洞） | 规则 | 0.824 / 1.000 / 0.903 | 0/2 | 0% |
+
+丢的那一分（9.45 s，A 下网）：球撞网弹回，水平速度反向，轨迹层把它当成 B 击球，
+之后的“落在自己半台”就不成立了。YOLO 在这里看到的帧更多，卡尔曼速度变号被检出；
+TrackNet 帧少，恰好没触发。这是状态机“水平反向 = 击球”的局限，不是融合层的问题。

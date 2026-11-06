@@ -121,6 +121,8 @@ def _run_entry(entry: Dict[str, Any], manifest_dir: str, out_dir: str) -> Dict[s
     markup = _resolve(manifest_dir, entry.get("events_markup"))
     extended = _resolve(manifest_dir, entry.get("extended"))
     fps = float(entry.get("fps", 120.0))
+    # tracknet = 原方案；yolo = YOLO 主跟踪、TrackNet 只补 YOLO 丢球的帧（需要 yolo 观测）
+    primary = str(entry.get("primary", "tracknet"))
     deadline = int(entry.get("review_deadline_frames", 0))
     latency = int(entry.get("review_latency_frames", 0))
     split = str(entry.get("split") or ("tuning" if name in ("test_2", "test2") else "holdout"))
@@ -131,6 +133,8 @@ def _run_entry(entry: Dict[str, Any], manifest_dir: str, out_dir: str) -> Dict[s
         raise FileNotFoundError(f"{name}: events_markup 不存在: {markup}")
     if yolo and not os.path.isfile(yolo):
         yolo = None
+    if primary == "yolo" and not yolo:
+        raise FileNotFoundError(f"{name}: primary=yolo 需要 YOLO 观测")
     if extended and not os.path.isfile(extended):
         extended = None
     if ttnet_cache and not os.path.isfile(ttnet_cache):
@@ -162,7 +166,7 @@ def _run_entry(entry: Dict[str, Any], manifest_dir: str, out_dir: str) -> Dict[s
             review_deadline_frames=deadline,
             pre_ctx=(8 - int(entry.get("ttnet_k", DEFAULT_K))) if reviewer == "ttnet" else 0,
             post_ctx=int(entry.get("ttnet_k", DEFAULT_K)) if reviewer == "ttnet" else 0,
-            fps=fps, ttnet_args=tt_args,
+            fps=fps, ttnet_args=tt_args, primary=primary,
         )
         write_outputs(run_dir, res)
         eval_prop = evaluate_proposals(run_dir, markup, tracknet, fps)
