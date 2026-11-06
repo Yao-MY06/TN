@@ -110,5 +110,21 @@ class TestRunBatchTest2(unittest.TestCase):
                 tmp, "out", "test_2_ttnet", "eval_ttnet_outside.json")))
 
 
+class TestManifestExample(unittest.TestCase):
+    def test_example_manifest_structure(self):
+        import json as _json
+        path = os.path.join(TN_ROOT, "cascade", "batch_manifest.example.json")
+        with open(path, encoding="utf-8") as f:
+            doc = _json.load(f)
+        vids = {v["name"]: v for v in doc["videos"]}
+        self.assertEqual(sorted(vids), [f"test_{n}" for n in range(1, 8)])
+        self.assertEqual(vids["test_2"]["split"], "tuning")
+        self.assertTrue(all(v["split"] == "holdout" for k, v in vids.items() if k != "test_2"))
+        self.assertEqual(vids["test_4"]["quad"], "test_4")
+        for v in vids.values():
+            for key in ("tracknet", "events_markup", "quad"):
+                self.assertIn(key, v)
+
+
 if __name__ == "__main__":
     unittest.main()

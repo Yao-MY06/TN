@@ -215,7 +215,11 @@ python -m cascade.ttnet_k_check --ttnet-cache _data/ttnet/test_2.jsonl --gt \
   因此 `latency <= N` 与非截止运行逐项一致。超过截止时生成 `status="timeout"`、`reason="deadline_exceeded"` 的
   空事件结果，水位线不再等待；原复核结果后来到达时只写入 `late_results.jsonl`，不交给状态机。
 - `summary.json` 新增 `timeout_count`、`timeout_ratio`、`late_result_count`、`manual_confirm_count`、
-  `manual_confirm_ratio`、`missing_context_ratio`。
+  `manual_confirm_ratio`、`unreviewable_count`、`missing_context_ratio`。
+- 视频结束时尚未完成的复核同样按截止时间判：预计完成晚于截止的记 `timeout`，结果只进 `late_results.jsonl`。
+- `review_queue.jsonl` 每条带 `category`：`manual`（需要人看）或 `unreviewable`（复核器无法判断，如规则复核遇到
+  只有丢球触发的片段，原因码 `no_reviewable_candidate`）。人工确认比例只算 `manual`，否则规则组会被这类片段撑大，
+  和 TTNet 组没有可比性（test_2：规则组 9 条全是 `unreviewable`）。
 - `review_queue.jsonl` 只收 `uncertain` / `error` / `timeout`（`rejected` 不算），每条含 clip 时间/帧范围、
   原因码、TTNet 最高驼峰、片段前后 1 秒内的判罚。
 
@@ -235,6 +239,7 @@ python -m cascade.ttnet_k_check --ttnet-cache _data/ttnet/test_2.jsonl --gt \
 ```
 
 ```bash
+# 先复制样例并按实际文件改路径：cascade/batch_manifest.example.json → cascade/batch_manifest.json
 python -m cascade.run_batch --manifest cascade/batch_manifest.json --out-dir outputs/cascade_batch
 ```
 

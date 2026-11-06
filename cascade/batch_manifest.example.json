@@ -1,0 +1,84 @@
+{
+  "_comment": [
+    "级联批量运行清单样例：复制为 cascade/batch_manifest.json 再按实际文件改路径。",
+    "相对路径相对本文件所在目录（cascade/）解析。test_2 为调参视频（tuning），其余为留出验证（holdout），留出视频不得调参。",
+    "events_markup 用原机的原版 OpenTTGames 标注；拿不到时 test_2 可临时用 ../_data/gt/extended_openttgames/inferred/test_2_events_markup_inferred.json（已验证可复现 TN 报告数字）。",
+    "quad 是 calib/table_quads.json 里的键：test_1、3～7 要先标四角（PLAN_week_1106.md 的 T6）。test_4 有内置预设 test4，但四角键是 test_4，必须显式写 quad。",
+    "ttnet_cache 缺省时该视频只跑 rule 组；yolo 可选。"
+  ],
+  "videos": [
+    {
+      "name": "test_1",
+      "split": "holdout",
+      "tracknet": "../_data/obs/tracknet/test_1.jsonl",
+      "ttnet_cache": "../_data/ttnet/test_1.jsonl",
+      "events_markup": "../_data/gt/openttgames/test_1/events_markup.json",
+      "extended": "../_data/gt/extended_openttgames/game_data/test/test_1.json",
+      "quad": "test_1",
+      "fps": 120.0
+    },
+    {
+      "name": "test_2",
+      "split": "tuning",
+      "tracknet": "../adapter/examples/test_2_observations.jsonl",
+      "yolo": "../_data/obs/yolo/test_2.jsonl",
+      "ttnet_cache": "../_data/ttnet/test_2.jsonl",
+      "events_markup": "../_data/gt/openttgames/test_2/events_markup.json",
+      "extended": "../_data/gt/extended_openttgames/game_data/test/test_2.json",
+      "quad": "test_2",
+      "fps": 120.0,
+      "preset": "test2"
+    },
+    {
+      "name": "test_3",
+      "split": "holdout",
+      "tracknet": "../_data/obs/tracknet/test_3.jsonl",
+      "ttnet_cache": "../_data/ttnet/test_3.jsonl",
+      "events_markup": "../_data/gt/openttgames/test_3/events_markup.json",
+      "extended": "../_data/gt/extended_openttgames/game_data/test/test_3.json",
+      "quad": "test_3",
+      "fps": 120.0
+    },
+    {
+      "name": "test_4",
+      "split": "holdout",
+      "tracknet": "../_data/obs/tracknet/test_4.jsonl",
+      "ttnet_cache": "../_data/ttnet/test_4.jsonl",
+      "events_markup": "../_data/gt/openttgames/test_4/events_markup.json",
+      "extended": "../_data/gt/extended_openttgames/game_data/test/test_4.json",
+      "quad": "test_4",
+      "fps": 120.0,
+      "preset": "test4"
+    },
+    {
+      "name": "test_5",
+      "split": "holdout",
+      "tracknet": "../_data/obs/tracknet/test_5.jsonl",
+      "ttnet_cache": "../_data/ttnet/test_5.jsonl",
+      "events_markup": "../_data/gt/openttgames/test_5/events_markup.json",
+      "extended": "../_data/gt/extended_openttgames/game_data/test/test_5.json",
+      "quad": "test_5",
+      "fps": 120.0
+    },
+    {
+      "name": "test_6",
+      "split": "holdout",
+      "tracknet": "../_data/obs/tracknet/test_6.jsonl",
+      "ttnet_cache": "../_data/ttnet/test_6.jsonl",
+      "events_markup": "../_data/gt/openttgames/test_6/events_markup.json",
+      "extended": "../_data/gt/extended_openttgames/game_data/test/test_6.json",
+      "quad": "test_6",
+      "fps": 120.0
+    },
+    {
+      "name": "test_7",
+      "split": "holdout",
+      "tracknet": "../_data/obs/tracknet/test_7.jsonl",
+      "ttnet_cache": "../_data/ttnet/test_7.jsonl",
+      "events_markup": "../_data/gt/openttgames/test_7/events_markup.json",
+      "extended": "../_data/gt/extended_openttgames/game_data/test/test_7.json",
+      "quad": "test_7",
+      "fps": 120.0
+    }
+  ]
+}

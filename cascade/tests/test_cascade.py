@@ -184,6 +184,23 @@ class TestReviewDeadline(unittest.TestCase):
             self.assertIsNotNone(row["start_frame_id"])
             self.assertIsNotNone(row["end_frame_id"])
 
+    def test_deadline_also_applies_to_clips_pending_at_end_of_stream(self):
+        """视频结束时还没复核完、且预计完成晚于截止的片段，也必须判 timeout。"""
+        res = run(OBS, preset="test2", review_latency_frames=240, review_deadline_frames=30)
+        s = res["summary"]
+        self.assertEqual(s["timeout_count"], s["clips"]["total"])
+        self.assertEqual(set(s["reviews"]), {"timeout"})
+        self.assertEqual(len(res["late_results"]), s["clips"]["total"])
+        bounce_events = [e for e in res["referee"].dumped_events if e["type"] == "BOUNCE"]
+        self.assertEqual(bounce_events, [])
+
+    def test_end_of_stream_within_deadline_is_delivered(self):
+        """截止时间足够长时，结尾片段照常交付，结果与不设截止相同。"""
+        base = run(OBS, preset="test2", review_latency_frames=20)["referee"]
+        r = run(OBS, preset="test2", review_latency_frames=20, review_deadline_frames=60)
+        self.assertEqual(r["summary"]["timeout_count"], 0)
+        self.assertEqual(r["referee"].dumped_events, base.dumped_events)
+
 
 class TestReviewQueue(unittest.TestCase):
     def test_manual_statuses_include_range_reason_hump_and_nearby_decisions(self):
@@ -282,7 +299,13 @@ class TestExtendedGroundTruth(unittest.TestCase):
             write_outputs(tmp, res)
             with open(os.path.join(tmp, "review_queue.jsonl"), encoding="utf-8") as f:
                 queue = [json.loads(line) for line in f if line.strip()]
-            self.assertEqual(len(queue), res["summary"]["manual_confirm_count"])
+            manual = [q for q in queue if q["category"] == "manual"]
+            self.assertEqual(len(manual), res["summary"]["manual_confirm_count"])
+            # 规则复核判断不了的丢球片段归为 unreviewable，不算人工确认
+            self.assertEqual(res["summary"]["manual_confirm_count"], 0)
+            self.assertEqual(res["summary"]["unreviewable_count"], 9)
+            self.assertTrue(all(q["reason"] == "no_reviewable_candidate"
+                                for q in queue if q["category"] == "unreviewable"))
             self.assertIn("manual_confirm_ratio", res["summary"])
             self.assertIn("missing_context_ratio", res["summary"])
             r = evaluate(tmp, EXT_GT)
