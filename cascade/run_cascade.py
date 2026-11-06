@@ -28,6 +28,7 @@ if __package__ in (None, ""):
     __package__ = "cascade"  # noqa: A001
 
 from cascade._paths import PRESET_TO_QUAD, load_detect_bounce  # noqa: E402
+from cascade.calib import build_calib_from_quad  # noqa: E402
 from cascade.committer import CommitConfig, StreamingReferee  # noqa: E402
 from cascade.frame_index import FrameIndex  # noqa: E402
 from cascade.proposals import ProposalGenerator, ProposalParams  # noqa: E402
@@ -36,6 +37,7 @@ from cascade.scheduler import ClipScheduler  # noqa: E402
 from cascade.ttnet_reviewer import add_ttnet_args, build_ttnet_reviewer  # noqa: E402
 
 import run_mixed as rm  # noqa: E402
+from core.geometry import CALIBRATION_PRESETS  # noqa: E402
 from core.schemas import FrameObservation  # noqa: E402
 from observation import load_observations  # noqa: E402
 
@@ -63,8 +65,13 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
     params = params or ProposalParams()
     commit = commit or CommitConfig()
     db = load_detect_bounce()
-    poly = db.load_quad(quad or PRESET_TO_QUAD.get(preset, preset))
-    calib = rm.build_calib(preset)
+    quad_key = quad or PRESET_TO_QUAD.get(preset, preset)
+    poly = db.load_quad(quad_key)
+    if preset in CALIBRATION_PRESETS or preset == "game4":
+        calib = rm.build_calib(preset)
+    else:
+        # test_1、test_3、test_5~7 等新机位没有 core 预设，四角是唯一机位参数来源。
+        calib = build_calib_from_quad(quad_key)
 
     raw = load_observations(jsonl)
     yolo = {d["frame_id"]: d for d in load_observations(yolo_jsonl)} if yolo_jsonl else None
