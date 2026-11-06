@@ -53,6 +53,30 @@ def match(pred: List[int], gt: List[int], tol: int) -> Dict:
             "n_gt": len(gt), "p": round(p, 4), "r": round(r, 4), "f1": round(f1, 4)}
 
 
+# OpenTTGames 测试集只标了部分区间：test_1 / test_4 / test_7 各有一段 47~170 s 的空档，
+# 里面有真实回合但没有任何事件标注。空档里的检出既不能算对也不能算错，因此 P/R/F1
+# 另给一份只在标注区间内统计的版本。相邻两条标注间隔超过 UNANNOTATED_GAP_S 视为空档；
+# 正常回合之间的死球时间（test_2～test_6 最长约 14 s）不会被切开。
+UNANNOTATED_GAP_S = 30.0
+SPAN_PAD_S = 1.0
+
+
+def annotated_spans(markup: Dict[int, str], fps: float = 120.0,
+                    gap_s: float = UNANNOTATED_GAP_S, pad_s: float = SPAN_PAD_S) -> List[List[int]]:
+    """按标注帧聚类出"有人标过"的区间（闭区间，前后各外扩 pad_s）。"""
+    ks = sorted(markup)
+    if not ks:
+        return []
+    gap, pad = gap_s * fps, int(round(pad_s * fps))
+    spans = [[ks[0], ks[0]]]
+    for k in ks[1:]:
+        if k - spans[-1][1] <= gap:
+            spans[-1][1] = k
+        else:
+            spans.append([k, k])
+    return [[max(0, a - pad), b + pad] for a, b in spans]
+
+
 def evaluate(run_dir: str, markup_path: str, jsonl: Optional[str] = None,
              fps: float = 120.0, tol: int = 5) -> Dict:
     with open(markup_path, encoding="utf-8") as f:
@@ -93,6 +117,9 @@ def evaluate(run_dir: str, markup_path: str, jsonl: Optional[str] = None,
                        if e["type"] == "BOUNCE")
     confirmed = [f for f in confirmed if f < max_frame]
 
+    spans_gt = annotated_spans(markup, fps)
+    confirmed_in = [f for f in confirmed if any(a <= f <= b for a, b in spans_gt)]
+
     n_cov = len(gt_bounce) - len(missed)
     out = {
         "run_dir": run_dir, "markup": os.path.basename(markup_path), "annotated_frames": max_frame,
@@ -106,6 +133,9 @@ def evaluate(run_dir: str, markup_path: str, jsonl: Optional[str] = None,
         "ttnet_window_ratio": summary["clips"]["ttnet_window_ratio"],
         "confirmed_bounce_tol5": match(confirmed, gt_bounce, 5),
         "confirmed_bounce_tol12": match(confirmed, gt_bounce, 12),
+        "annotated_spans": spans_gt,
+        "confirmed_outside_markup": len(confirmed) - len(confirmed_in),
+        "confirmed_bounce_tol5_in_markup": match(confirmed_in, gt_bounce, 5),
         "score": summary["score"], "decisions": summary["decisions"],
     }
     return out
@@ -128,6 +158,9 @@ def main(argv=None) -> int:
     print(f"覆盖 / 窗口占比 : {r['coverage'] * 100:.1f}% / {r['ttnet_window_ratio'] * 100:.1f}%")
     print(f"确认落台 ±5 帧  : P {c5['p']:.3f}  R {c5['r']:.3f}  F1 {c5['f1']:.3f}  ({c5['tp']}/{c5['n_pred']}/{c5['n_gt']})")
     print(f"确认落台 ±12 帧 : P {c12['p']:.3f}  R {c12['r']:.3f}  F1 {c12['f1']:.3f}")
+    ci = r["confirmed_bounce_tol5_in_markup"]
+    print(f"仅标注区间 ±5 帧: P {ci['p']:.3f}  R {ci['r']:.3f}  F1 {ci['f1']:.3f}"
+          f"  （{len(r['annotated_spans'])} 段；空档内检出 {r['confirmed_outside_markup']} 条不计）")
     if r["missed_bounces"]:
         print(f"漏提议 {len(r['missed_bounces'])} 条：")
         for m in r["missed_bounces"]:

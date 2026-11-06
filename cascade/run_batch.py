@@ -89,11 +89,15 @@ def _pct_from_counts(tp: int, fp: int, fn: int) -> Dict[str, Any]:
 
 def _reviewer_stats(eval_prop: Dict[str, Any], eval_ext: Optional[Dict[str, Any]],
                     summary: Dict[str, Any], outside: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    b = eval_prop["confirmed_bounce_tol5"]
+    # 主指标只在标注区间内统计（见 eval_proposals.annotated_spans）；全片口径留在 *_full。
+    b = eval_prop.get("confirmed_bounce_tol5_in_markup") or eval_prop["confirmed_bounce_tol5"]
+    full = eval_prop["confirmed_bounce_tol5"]
     points = (eval_ext or {}).get("points", {})
     return {
         "tp": b["tp"], "fp": b["fp"], "fn": b["fn"],
         "p": b["p"], "r": b["r"], "f1": b["f1"],
+        "f1_full": full["f1"],
+        "outside_markup": eval_prop.get("confirmed_outside_markup", 0),
         "points_correct": points.get("correct"),
         "points_total": points.get("gt"),
         "spurious_points": len(points.get("spurious_points", [])) if eval_ext else None,
@@ -240,6 +244,7 @@ def aggregate_holdout(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
             "manual_confirm_count": sum(s["manual_confirm_count"] for s in stats),
             "unreviewable_count": sum(s.get("unreviewable_count", 0) for s in stats),
             "timeout_count": sum(s["timeout_count"] for s in stats),
+            "outside_markup": sum(s.get("outside_markup", 0) for s in stats),
             "clips": clips,
             "ttnet_outside_truth_misses": sum(outside) if outside else None,
             "_gt_bounce": sum(s["_gt_bounce"] for s in stats),
@@ -284,6 +289,8 @@ def _display_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "ttnet_points": (f"{(row.get('ttnet') or {}).get('points_correct')}/"
                          f"{(row.get('ttnet') or {}).get('points_total')}"
                          if row.get("ttnet") and (row.get("ttnet") or {}).get("points_total") is not None else "-"),
+        "rule_outside_markup": (row.get("rule") or {}).get("outside_markup"),
+        "ttnet_outside_markup": (row.get("ttnet") or {}).get("outside_markup"),
         "rule_spurious": (row.get("rule") or {}).get("spurious_points"),
         "ttnet_spurious": (row.get("ttnet") or {}).get("spurious_points"),
         "rule_manual_confirm_ratio": ratio(row, "rule", "manual_confirm_count"),
@@ -300,6 +307,7 @@ def _display_row(row: Dict[str, Any]) -> Dict[str, Any]:
 CSV_FIELDS = [
     "video", "split", "frames", "proposal_recall", "coverage", "ttnet_window_ratio",
     "rule_p", "rule_r", "rule_f1", "ttnet_p", "ttnet_r", "ttnet_f1",
+    "rule_outside_markup", "ttnet_outside_markup",
     "rule_points", "ttnet_points", "rule_spurious", "ttnet_spurious",
     "rule_manual_confirm_ratio", "ttnet_manual_confirm_ratio",
     "rule_unreviewable_count", "ttnet_unreviewable_count",
@@ -317,8 +325,8 @@ def _write_summary(out_dir: str, rows: List[Dict[str, Any]], total: Optional[Dic
         writer.writeheader()
         writer.writerows(display)
 
-    headers = ["视频", "划分", "提议召回", "覆盖", "TTNet窗口", "规则 P/R/F1",
-               "TTNet P/R/F1", "规则得分", "TTNet得分", "多判(规则/TTNet)",
+    headers = ["视频", "划分", "帧数", "提议召回", "覆盖", "TTNet窗口", "规则 P/R/F1",
+               "TTNet P/R/F1", "空档检出(规则/TTNet)", "规则得分", "TTNet得分", "多判(规则/TTNet)",
                "人工确认(规则/TTNet)", "超时(规则/TTNet)", "片段外真值漏检", "备注"]
     lines = ["# 级联批量汇总", "",
              "| " + " | ".join(headers) + " |",
@@ -331,15 +339,18 @@ def _write_summary(out_dir: str, rows: List[Dict[str, Any]], total: Optional[Dic
         timeout = "/".join(_blank(d[k], 3) for k in ("rule_timeout_ratio",
                                                       "ttnet_timeout_ratio"))
         spurious = "/".join(_blank(d[k]) for k in ("rule_spurious", "ttnet_spurious"))
+        unlabeled = "/".join(_blank(d[k]) for k in ("rule_outside_markup", "ttnet_outside_markup"))
         vals = [
             d["video"], d["split"], _blank(d["frames"]),
             _blank(d["proposal_recall"], 4), _blank(d["coverage"], 4),
-            _blank(d["ttnet_window_ratio"], 4), rule_prf, tt_prf, d["rule_points"],
+            _blank(d["ttnet_window_ratio"], 4), rule_prf, tt_prf, unlabeled, d["rule_points"],
             d["ttnet_points"], spurious, manual, timeout,
             _blank(d["ttnet_outside_truth_misses"]), d["notes"] or "-",
         ]
         lines.append("| " + " | ".join(str(v) for v in vals) + " |")
     lines += ["", "说明：holdout 合计的 P/R/F1 按 tp/fp/fn 汇总后重算，不是各视频 F1 平均。",
+              "P/R/F1 只在 events_markup 的标注区间内统计：相邻标注间隔超过 30 s 视为未标注空档"
+              "（test_1 / test_4 / test_7 各有一段），空档内的检出不计入，条数见“空档检出”列。",
               "人工确认比例不含复核器无法判断的片段（规则复核遇到只有丢球触发的片段，"
               "原因码 no_reviewable_candidate），其条数见 summary.csv 的 *_unreviewable_count。", ""]
     with open(os.path.join(out_dir, "summary.md"), "w", encoding="utf-8") as f:
