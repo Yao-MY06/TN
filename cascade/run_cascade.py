@@ -31,6 +31,7 @@ from cascade._paths import PRESET_TO_QUAD, load_detect_bounce  # noqa: E402
 from cascade.calib import build_calib_from_quad  # noqa: E402
 from cascade.committer import CommitConfig, StreamingReferee  # noqa: E402
 from cascade.frame_index import FrameIndex  # noqa: E402
+from cascade.fuse_obs import FuseParams, fuse  # noqa: E402
 from cascade.proposals import ProposalGenerator, ProposalParams  # noqa: E402
 from cascade.review_queue import build_review_queue  # noqa: E402
 from cascade.reviewers import OracleReviewer, ReviewResult, RuleReviewer  # noqa: E402
@@ -63,7 +64,8 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
         review_latency_frames: int = 0, review_deadline_frames: int = 0,
         merge: bool = True, max_clip_s: float = 1.0,
         pre_ctx: int = 0, post_ctx: int = 0, session_id: str = "s01",
-        fps: float = 120.0, ttnet_args: Any = None) -> Dict[str, Any]:
+        fps: float = 120.0, ttnet_args: Any = None,
+        primary: str = "tracknet", fuse_params: Optional[FuseParams] = None) -> Dict[str, Any]:
     if review_latency_frames < 0 or review_deadline_frames < 0:
         raise ValueError("review latency/deadline frames must be >= 0")
     params = params or ProposalParams()
@@ -79,6 +81,15 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
 
     raw = load_observations(jsonl)
     yolo = {d["frame_id"]: d for d in load_observations(yolo_jsonl)} if yolo_jsonl else None
+    fuse_stats = None
+    if primary == "yolo":
+        # YOLO 主跟踪，TrackNet 只在回合中 YOLO 丢球的帧补位（fuse_obs.py）。
+        if yolo is None:
+            raise SystemExit("--primary yolo 需要 --yolo")
+        raw, fuse_stats = fuse(list(yolo.values()), raw, fuse_params)
+        yolo = None  # YOLO 已经是主轨迹，“YOLO 与 TrackNet 分歧”触发器不再适用
+    elif primary != "tracknet":
+        raise SystemExit(f"未知 primary: {primary}")
 
     index = FrameIndex()
     gen = ProposalGenerator(poly, index, params, session_id)
@@ -250,6 +261,9 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
         "params": asdict(params), "commit": asdict(commit),
         "merge": merge, "max_clip_s": max_clip_s, "pre_ctx": pre_ctx, "post_ctx": post_ctx,
     }
+    summary["primary"] = primary
+    if fuse_stats is not None:
+        summary["fusion"] = fuse_stats
     if rev.name == "ttnet":
         ms = sorted(rev.scores.infer_ms)
         summary["ttnet"] = {
@@ -328,7 +342,12 @@ def print_summary(s: Dict[str, Any]) -> None:
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="YOLO → TrackNet 提议 → 复核 → 状态机 级联回放")
     ap.add_argument("--jsonl", required=True, help="TrackNet 逐帧观测（§7.1）")
-    ap.add_argument("--yolo", default=None, help="可选：同一视频的 YOLO 逐帧观测，用于分歧触发")
+    ap.add_argument("--yolo", default=None, help="同一视频的 YOLO 逐帧观测；--primary yolo 时必需")
+    ap.add_argument("--primary", default="tracknet", choices=["tracknet", "yolo"],
+                    help="主跟踪层：tracknet=原方案；yolo=YOLO 逐帧主跟踪、TrackNet 只补 YOLO 丢球的帧")
+    ap.add_argument("--yolo-min-conf", type=float, default=0.5)
+    ap.add_argument("--fill-window-frames", type=int, default=60,
+                    help="最近多少帧内见过球才调用 TrackNet 补位；-1=YOLO 一丢就调")
     ap.add_argument("--preset", default="test2")
     ap.add_argument("--quad", default=None, help="calib/table_quads.json 的键，默认由 preset 推出")
     ap.add_argument("--reviewer", default="rule", choices=["rule", "oracle", "ttnet"])
@@ -372,7 +391,11 @@ def main(argv: Optional[List[str]] = None) -> int:
               a.review_latency_frames, a.review_deadline_frames,
               merge=not a.no_merge, max_clip_s=a.max_clip_s,
               pre_ctx=a.pre_ctx, post_ctx=a.post_ctx,
-              ttnet_args=a if a.reviewer == "ttnet" else None)
+              ttnet_args=a if a.reviewer == "ttnet" else None,
+              primary=a.primary,
+              fuse_params=FuseParams(yolo_min_conf=a.yolo_min_conf,
+                                     fill_window_frames=None if a.fill_window_frames < 0
+                                     else a.fill_window_frames))
     if not a.quiet:
         print_summary(res["summary"])
     if a.out_dir:
