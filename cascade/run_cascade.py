@@ -123,15 +123,20 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
                     still.append(item)
                 continue
 
-            if force or item["due_pos"] <= pos:
+            deadline_pos = item["deadline_pos"]
+            due = item["due_pos"] <= pos
+            # 流结束（force）时也按截止时间判：预计完成晚于截止的，照样记 timeout，
+            # 不能因为视频到头了就把本该超时的结果当正常结果提交。
+            late_at_end = (force and not due and deadline_pos is not None
+                           and item["due_pos"] > deadline_pos)
+            if (force or due) and not late_at_end:
                 r = item["result"]
                 r.completed_frame_id = index.last_frame_id
                 results.append(r)
                 ref.add_bounces(r.events)
                 continue
 
-            deadline_pos = item["deadline_pos"]
-            if deadline_pos is not None and deadline_pos <= pos:
+            if deadline_pos is not None and (deadline_pos <= pos or late_at_end):
                 timeout = ReviewResult(
                     c.clip_id, c.proposal_ids, "timeout", [], "deadline_exceeded",
                     per_proposal={pid: "timeout:deadline_exceeded" for pid in c.proposal_ids},
@@ -223,8 +228,11 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
         "timeout_ratio": round(sum(r.status == "timeout" for r in results)
                                / max(1, len(sched.submitted)), 4),
         "late_result_count": len(late_results),
-        "manual_confirm_count": len(review_queue),
-        "manual_confirm_ratio": round(len(review_queue) / max(1, len(sched.submitted)), 4),
+        # 规则复核判断不了的片段（no_reviewable_candidate）不算“需要人工确认”，单独计数
+        "manual_confirm_count": sum(q["category"] == "manual" for q in review_queue),
+        "manual_confirm_ratio": round(sum(q["category"] == "manual" for q in review_queue)
+                                      / max(1, len(sched.submitted)), 4),
+        "unreviewable_count": sum(q["category"] == "unreviewable" for q in review_queue),
         "missing_context_ratio": round(sched.stats["missing_context"]
                                        / max(1, len(sched.submitted)), 4),
         "bounces": {"confirmed": sum(len(r.events) for r in results),

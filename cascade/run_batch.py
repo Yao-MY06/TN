@@ -98,6 +98,7 @@ def _reviewer_stats(eval_prop: Dict[str, Any], eval_ext: Optional[Dict[str, Any]
         "points_total": points.get("gt"),
         "spurious_points": len(points.get("spurious_points", [])) if eval_ext else None,
         "manual_confirm_count": summary.get("manual_confirm_count", 0),
+        "unreviewable_count": summary.get("unreviewable_count", 0),
         "timeout_count": summary.get("timeout_count", 0),
         "clips": summary.get("clips", {}).get("total", 0),
         "ttnet_outside_truth_misses": (outside or {}).get("outside_truth_matches"),
@@ -237,6 +238,7 @@ def aggregate_holdout(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
             "spurious_points": sum(s["spurious_points"] for s in stats
                                    if s.get("spurious_points") is not None) if points else None,
             "manual_confirm_count": sum(s["manual_confirm_count"] for s in stats),
+            "unreviewable_count": sum(s.get("unreviewable_count", 0) for s in stats),
             "timeout_count": sum(s["timeout_count"] for s in stats),
             "clips": clips,
             "ttnet_outside_truth_misses": sum(outside) if outside else None,
@@ -286,6 +288,8 @@ def _display_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "ttnet_spurious": (row.get("ttnet") or {}).get("spurious_points"),
         "rule_manual_confirm_ratio": ratio(row, "rule", "manual_confirm_count"),
         "ttnet_manual_confirm_ratio": ratio(row, "ttnet", "manual_confirm_count"),
+        "rule_unreviewable_count": (row.get("rule") or {}).get("unreviewable_count"),
+        "ttnet_unreviewable_count": (row.get("ttnet") or {}).get("unreviewable_count"),
         "rule_timeout_ratio": ratio(row, "rule", "timeout_count"),
         "ttnet_timeout_ratio": ratio(row, "ttnet", "timeout_count"),
         "ttnet_outside_truth_misses": (row.get("ttnet") or {}).get("ttnet_outside_truth_misses"),
@@ -298,6 +302,7 @@ CSV_FIELDS = [
     "rule_p", "rule_r", "rule_f1", "ttnet_p", "ttnet_r", "ttnet_f1",
     "rule_points", "ttnet_points", "rule_spurious", "ttnet_spurious",
     "rule_manual_confirm_ratio", "ttnet_manual_confirm_ratio",
+    "rule_unreviewable_count", "ttnet_unreviewable_count",
     "rule_timeout_ratio", "ttnet_timeout_ratio", "ttnet_outside_truth_misses", "notes",
 ]
 
@@ -334,7 +339,9 @@ def _write_summary(out_dir: str, rows: List[Dict[str, Any]], total: Optional[Dic
             _blank(d["ttnet_outside_truth_misses"]), d["notes"] or "-",
         ]
         lines.append("| " + " | ".join(str(v) for v in vals) + " |")
-    lines += ["", "说明：holdout 合计的 P/R/F1 按 tp/fp/fn 汇总后重算，不是各视频 F1 平均。", ""]
+    lines += ["", "说明：holdout 合计的 P/R/F1 按 tp/fp/fn 汇总后重算，不是各视频 F1 平均。",
+              "人工确认比例不含复核器无法判断的片段（规则复核遇到只有丢球触发的片段，"
+              "原因码 no_reviewable_candidate），其条数见 summary.csv 的 *_unreviewable_count。", ""]
     with open(os.path.join(out_dir, "summary.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
