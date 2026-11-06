@@ -32,6 +32,7 @@ from cascade.calib import build_calib_from_quad  # noqa: E402
 from cascade.committer import CommitConfig, StreamingReferee  # noqa: E402
 from cascade.frame_index import FrameIndex  # noqa: E402
 from cascade.proposals import ProposalGenerator, ProposalParams  # noqa: E402
+from cascade.review_queue import build_review_queue  # noqa: E402
 from cascade.reviewers import OracleReviewer, ReviewResult, RuleReviewer  # noqa: E402
 from cascade.scheduler import ClipScheduler  # noqa: E402
 from cascade.ttnet_reviewer import add_ttnet_args, build_ttnet_reviewer  # noqa: E402
@@ -201,6 +202,9 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
     rel_lag = [real - evt for _, evt, real in ref.release_lag]
     dec_lag = [r["real_t"] - r["virtual_t"] for r in ref.decision_records]
     reasons = Counter(r for p in proposals for r in p.reasons)
+    review_queue = build_review_queue({
+        "results": results, "clips": sched.submitted, "reviewer": rev, "referee": ref,
+    })
     summary = {
         "input": os.path.basename(jsonl), "preset": preset, "reviewer": rev.name,
         "frames": len(raw), "duration_s": round(t1 - t0, 3),
@@ -219,6 +223,10 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
         "timeout_ratio": round(sum(r.status == "timeout" for r in results)
                                / max(1, len(sched.submitted)), 4),
         "late_result_count": len(late_results),
+        "manual_confirm_count": len(review_queue),
+        "manual_confirm_ratio": round(len(review_queue) / max(1, len(sched.submitted)), 4),
+        "missing_context_ratio": round(sched.stats["missing_context"]
+                                       / max(1, len(sched.submitted)), 4),
         "bounces": {"confirmed": sum(len(r.events) for r in results),
                     "kept_after_jitter": len(ref.kept_bounces),
                     "jitter_dropped": [round(e.timestamp_s, 3) for e in ref.jitter_dropped]},
@@ -245,7 +253,8 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
     if isinstance(rev, OracleReviewer):
         summary["oracle_missed"] = [round(e["timestamp_s"], 3) for e in rev.missed()]
     return {"summary": summary, "proposals": proposals, "clips": sched.submitted,
-            "results": results, "late_results": late_results, "referee": ref, "reviewer": rev}
+            "results": results, "late_results": late_results, "review_queue": review_queue,
+            "referee": ref, "reviewer": rev}
 
 
 def write_outputs(out_dir: str, res: Dict[str, Any]) -> None:
@@ -260,6 +269,7 @@ def write_outputs(out_dir: str, res: Dict[str, Any]) -> None:
     dump("clips.jsonl", [c.to_dict() for c in res["clips"]])
     dump("reviews.jsonl", [r.to_dict() for r in res["results"]])
     dump("late_results.jsonl", [r.to_dict() for r in res.get("late_results", [])])
+    dump("review_queue.jsonl", res.get("review_queue") or build_review_queue(res))
     dump("events.jsonl", res["referee"].dumped_events)
     dump("decisions.jsonl", res["referee"].decision_records)
     if getattr(res.get("reviewer"), "name", "") == "ttnet":
