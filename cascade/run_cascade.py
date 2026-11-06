@@ -1,6 +1,6 @@
 """级联回放运行器：观测 JSONL → 提议 → 调度 → 复核 → 按事件时间提交 → 状态机。
 
-逐帧流式处理（因果），"真实时刻"按视频帧时间计；``--review-latency-frames``
+逐帧流式处理（因果），"真实时刻"按视频帧时间计；``--review-latency-s``
 模拟复核耗时。判罚应与延迟无关（见 committer.py 的说明），延迟只影响输出时刻。
 
 用法（在 TN 仓库根目录）::
@@ -20,8 +20,10 @@ import json
 import os
 import sys
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Dict, List, Optional
+
+_EPS_T = 1e-6   # 时间比较容差（秒）
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -61,13 +63,15 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
         reviewer: str = "rule", oracle_events: Optional[str] = None,
         yolo_jsonl: Optional[str] = None,
         params: Optional[ProposalParams] = None, commit: Optional[CommitConfig] = None,
-        review_latency_frames: int = 0, review_deadline_frames: int = 0,
+        review_latency_s: float = 0.0, review_deadline_s: float = 0.0,
         merge: bool = True, max_clip_s: float = 1.0,
         pre_ctx: int = 0, post_ctx: int = 0, session_id: str = "s01",
         fps: float = 120.0, ttnet_args: Any = None,
-        primary: str = "tracknet", fuse_params: Optional[FuseParams] = None) -> Dict[str, Any]:
-    if review_latency_frames < 0 or review_deadline_frames < 0:
-        raise ValueError("review latency/deadline frames must be >= 0")
+        primary: str = "tracknet", fuse_params: Optional[FuseParams] = None,
+        yolo_recapture: bool = True) -> Dict[str, Any]:
+    # 方案 §4.1：超时一律按时间戳，不按固定帧数（各模型帧率、延迟不同）。
+    if review_latency_s < 0 or review_deadline_s < 0:
+        raise ValueError("review latency/deadline must be >= 0 s")
     params = params or ProposalParams()
     commit = commit or CommitConfig()
     db = load_detect_bounce()
@@ -81,22 +85,26 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
 
     raw = load_observations(jsonl)
     yolo = {d["frame_id"]: d for d in load_observations(yolo_jsonl)} if yolo_jsonl else None
+    # 观测融合（fuse_obs.py）。默认按方案：TrackNet 连续轨迹，YOLO 在 TrackNet 丢球的帧
+    # 重新捕获；两者分歧仍交给提议层的 yolo_disagree 触发器（质量检查）。
     fuse_stats = None
-    if primary == "yolo":
-        # YOLO 主跟踪，TrackNet 只在回合中 YOLO 丢球的帧补位（fuse_obs.py）。
-        if yolo is None:
-            raise SystemExit("--primary yolo 需要 --yolo")
-        raw, fuse_stats = fuse(list(yolo.values()), raw, fuse_params)
-        yolo = None  # YOLO 已经是主轨迹，“YOLO 与 TrackNet 分歧”触发器不再适用
-    elif primary != "tracknet":
+    if primary not in ("tracknet", "yolo"):
         raise SystemExit(f"未知 primary: {primary}")
+    if primary == "yolo" and yolo is None:
+        raise SystemExit("--primary yolo 需要 --yolo")
+    if yolo is not None and (primary == "yolo" or yolo_recapture):
+        fp = replace(fuse_params or FuseParams(), primary=primary)
+        raw, fuse_stats = fuse(list(yolo.values()), raw, fp)
+        if primary == "yolo":
+            yolo = None  # YOLO 已是主轨迹，分歧触发器不再适用
+    src_of = {int(d["frame_id"]): d["source"] for d in raw}
 
     index = FrameIndex()
     gen = ProposalGenerator(poly, index, params, session_id)
     sched = ClipScheduler(index, pre_ctx, post_ctx, merge=merge, max_clip_s=max_clip_s,
                           session_id=session_id)
     if reviewer == "rule":
-        rev = RuleReviewer(poly, fps=fps)
+        rev = RuleReviewer(poly, fps=fps, source_of=src_of.get)
     elif reviewer == "oracle":
         if not oracle_events:
             raise SystemExit("--reviewer oracle 需要 --oracle-events")
@@ -111,22 +119,22 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
     ref = StreamingReferee(calib, commit)
 
     proposals, results, late_results = [], [], []
-    # 每项：提交位置、模拟完成位置、截止位置、clip 和已经算出的结果。
-    # review() 在当前实现中是同步的；due_pos 模拟结果到达提交层的时间。
+    # 每项：模拟完成时刻、截止时刻（视频时间）、clip 和已经算出的结果。
+    # review() 在当前实现中是同步的；due_t 模拟结果到达提交层的时间。
     inflight: List[Dict[str, Any]] = []
 
     def earliest_event_t(c) -> float:
         a = min(p.anchor_timestamp_s for p in c.proposals) - rev.max_lead_s
         return max(c.start_timestamp_s, a)
 
-    def deliver(pos: int, force: bool = False) -> None:
+    def deliver(now_t: float, force: bool = False) -> None:
         """交付到期结果；超时项合成 timeout，原结果稍后只写 late_results。"""
         still: List[Dict[str, Any]] = []
         for item in inflight:
             c = item["clip"]
             if item["timed_out"]:
                 # 迟到的真实结果绝不送状态机，只留作诊断。
-                if force or item["due_pos"] <= pos:
+                if force or item["due_t"] <= now_t + _EPS_T:
                     r = item["result"]
                     r.completed_frame_id = index.last_frame_id
                     late_results.append(r)
@@ -134,12 +142,12 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
                     still.append(item)
                 continue
 
-            deadline_pos = item["deadline_pos"]
-            due = item["due_pos"] <= pos
+            deadline_t = item["deadline_t"]
+            due = item["due_t"] <= now_t + _EPS_T
             # 流结束（force）时也按截止时间判：预计完成晚于截止的，照样记 timeout，
             # 不能因为视频到头了就把本该超时的结果当正常结果提交。
-            late_at_end = (force and not due and deadline_pos is not None
-                           and item["due_pos"] > deadline_pos)
+            late_at_end = (force and not due and deadline_t is not None
+                           and item["due_t"] > deadline_t + _EPS_T)
             if (force or due) and not late_at_end:
                 r = item["result"]
                 r.completed_frame_id = index.last_frame_id
@@ -147,7 +155,7 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
                 ref.add_bounces(r.events)
                 continue
 
-            if deadline_pos is not None and (deadline_pos <= pos or late_at_end):
+            if deadline_t is not None and (deadline_t <= now_t + _EPS_T or late_at_end):
                 timeout = ReviewResult(
                     c.clip_id, c.proposal_ids, "timeout", [], "deadline_exceeded",
                     per_proposal={pid: "timeout:deadline_exceeded" for pid in c.proposal_ids},
@@ -192,25 +200,26 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
             inflight.append({
                 "clip": c,
                 "result": rev.review(c),
-                "due_pos": pos + review_latency_frames,
-                "deadline_pos": pos + review_deadline_frames if review_deadline_frames else None,
+                "due_t": ts + review_latency_s,
+                "deadline_t": ts + review_deadline_s if review_deadline_s else None,
                 "timed_out": False,
             })
-        deliver(pos)
+        deliver(ts)
         ref.advance(bounce_unknown_before())
 
     tail = gen.flush()
     proposals.extend(tail)
     sched.add(tail)
+    end_t = (index.last_timestamp + 1.0 / fps) if raw else 0.0   # 流结束 = 最后一帧之后
     for c in sched.poll(float("inf"), final=True):
         inflight.append({
             "clip": c,
             "result": rev.review(c),
-            "due_pos": len(raw) + review_latency_frames,
-            "deadline_pos": len(raw) + review_deadline_frames if review_deadline_frames else None,
+            "due_t": end_t + review_latency_s,
+            "deadline_t": end_t + review_deadline_s if review_deadline_s else None,
             "timed_out": False,
         })
-    deliver(len(raw), force=True)
+    deliver(end_t, force=True)
     ref.finish()
 
     # ---------------------------------------------------------------- 汇总
@@ -254,7 +263,7 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
             "event_release_p50": _pct(rel_lag, 0.5), "event_release_p95": _pct(rel_lag, 0.95),
             "event_release_max": max(rel_lag) if rel_lag else None,
             "decision_p50": _pct(dec_lag, 0.5), "decision_p95": _pct(dec_lag, 0.95),
-            "review_latency_frames": review_latency_frames,
+            "review_latency_s": review_latency_s,
         },
         "n_lowconf_masked": ref.n_lowconf,
         "serve_guard_suppressed": [round(ev.timestamp_s, 3) for ev, _ in (ref.source.suppressed_serve if ref.source else [])],
@@ -292,7 +301,9 @@ def write_outputs(out_dir: str, res: Dict[str, Any]) -> None:
     dump("reviews.jsonl", [r.to_dict() for r in res["results"]])
     dump("late_results.jsonl", [r.to_dict() for r in res.get("late_results", [])])
     dump("review_queue.jsonl", res.get("review_queue") or build_review_queue(res))
-    dump("events.jsonl", res["referee"].dumped_events)
+    ref = res["referee"]
+    dump("events.jsonl", [{**e, "sources": ref.event_sources.get(e["event_id"], [])}
+                          for e in ref.dumped_events])
     dump("decisions.jsonl", res["referee"].decision_records)
     if getattr(res.get("reviewer"), "name", "") == "ttnet":
         dump("ttnet_reviews.jsonl", res["reviewer"].log)
@@ -327,7 +338,7 @@ def print_summary(s: Dict[str, Any]) -> None:
     fmt = lambda v: "-" if v is None else f"{v:.3f}s"  # noqa: E731
     print(f"提交延迟        : 事件 P50 {fmt(lat['event_release_p50'])} / P95 {fmt(lat['event_release_p95'])}；"
           f"判罚 P50 {fmt(lat['decision_p50'])} / P95 {fmt(lat['decision_p95'])}"
-          f"（复核模拟耗时 {lat['review_latency_frames']} 帧）")
+          f"（复核模拟耗时 {lat['review_latency_s']} s）")
     print(f"事件统计        : {s['event_counts']}")
     print(f"事件源统计      : {s['source_stats']}")
     if s["serve_guard_suppressed"]:
@@ -344,17 +355,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--jsonl", required=True, help="TrackNet 逐帧观测（§7.1）")
     ap.add_argument("--yolo", default=None, help="同一视频的 YOLO 逐帧观测；--primary yolo 时必需")
     ap.add_argument("--primary", default="tracknet", choices=["tracknet", "yolo"],
-                    help="主跟踪层：tracknet=原方案；yolo=YOLO 逐帧主跟踪、TrackNet 只补 YOLO 丢球的帧")
+                    help="主轨迹：tracknet=按方案（TrackNet 连续轨迹，YOLO 辅助）；"
+                         "yolo=试验（YOLO 主跟踪，TrackNet 只补 YOLO 丢球的帧）")
+    ap.add_argument("--no-yolo-recapture", action="store_true",
+                    help="primary=tracknet 时不用 YOLO 补 TrackNet 丢球的帧（只做分歧触发）")
     ap.add_argument("--yolo-min-conf", type=float, default=0.5)
-    ap.add_argument("--fill-window-frames", type=int, default=60,
-                    help="最近多少帧内见过球才调用 TrackNet 补位；-1=YOLO 一丢就调")
+    ap.add_argument("--fill-window-s", type=float, default=0.5,
+                    help="primary=yolo：最近多久见过球才调用 TrackNet 补位（秒）；-1=YOLO 一丢就调")
     ap.add_argument("--preset", default="test2")
     ap.add_argument("--quad", default=None, help="calib/table_quads.json 的键，默认由 preset 推出")
     ap.add_argument("--reviewer", default="rule", choices=["rule", "oracle", "ttnet"])
     ap.add_argument("--oracle-events", default=None)
-    ap.add_argument("--review-latency-frames", type=int, default=0)
-    ap.add_argument("--review-deadline-frames", type=int, default=0,
-                    help="片段提交后等待复核的帧数；0=不启用（默认）")
+    ap.add_argument("--review-latency-s", type=float, default=0.0, help="模拟复核耗时（秒）")
+    ap.add_argument("--review-deadline-s", type=float, default=0.0,
+                    help="片段提交后最多等待复核多少秒；0=不启用（默认）")
     ap.add_argument("--no-merge", action="store_true")
     ap.add_argument("--max-clip-s", type=float, default=1.0)
     ap.add_argument("--pre-ctx", type=int, default=None,
@@ -367,7 +381,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--table-margin-px", type=float, default=30.0)
     ap.add_argument("--hit-trigger", action="store_true", help="打开方向突变触发器（默认关）")
     ap.add_argument("--no-dropout-trigger", action="store_true")
-    ap.add_argument("--dropout-min-frames", type=int, default=6)
+    ap.add_argument("--dropout-min-s", type=float, default=0.05, help="台面附近持续丢球多久才提议（秒）")
     ap.add_argument("--no-jitter-merge", action="store_true")
     ap.add_argument("--no-out", action="store_true")
     ap.add_argument("--state-machine", default="tn", choices=["tn", "ttnet11-yolo", "ttnet11-ttnet"],
@@ -384,18 +398,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     params = ProposalParams(pre_s=a.pre_s, post_s=a.post_s, bounce_min_drop=a.bounce_min_drop,
                             table_margin_px=a.table_margin_px, hit_trigger=a.hit_trigger,
                             dropout_trigger=not a.no_dropout_trigger,
-                            dropout_min_frames=a.dropout_min_frames)
+                            dropout_min_s=a.dropout_min_s)
     commit = CommitConfig(jitter_merge=not a.no_jitter_merge, use_out=not a.no_out,
                           state_machine=a.state_machine)
     res = run(a.jsonl, a.preset, a.quad, a.reviewer, a.oracle_events, a.yolo, params, commit,
-              a.review_latency_frames, a.review_deadline_frames,
+              a.review_latency_s, a.review_deadline_s,
               merge=not a.no_merge, max_clip_s=a.max_clip_s,
               pre_ctx=a.pre_ctx, post_ctx=a.post_ctx,
               ttnet_args=a if a.reviewer == "ttnet" else None,
-              primary=a.primary,
+              primary=a.primary, yolo_recapture=not a.no_yolo_recapture,
               fuse_params=FuseParams(yolo_min_conf=a.yolo_min_conf,
-                                     fill_window_frames=None if a.fill_window_frames < 0
-                                     else a.fill_window_frames))
+                                     fill_window_s=None if a.fill_window_s < 0 else a.fill_window_s))
     if not a.quiet:
         print_summary(res["summary"])
     if a.out_dir:

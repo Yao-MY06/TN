@@ -13,8 +13,8 @@
       "quad": "test_2",                          # 可选，默认由预设推出
       "preset": "test2",                         # 可选
       "fps": 120.0,
-      "review_deadline_frames": 0,               # 可选
-      "review_latency_frames": 0                  # 可选，模拟慢复核
+      "review_deadline_s": 0,                    # 可选，秒（旧键 *_frames 按 fps 换算）
+      "review_latency_s": 0                       # 可选，模拟慢复核（秒）
     }]}
 
 相对路径相对清单文件所在目录解析。输出目录下每个视频有 ``<name>_rule`` 与
@@ -121,10 +121,12 @@ def _run_entry(entry: Dict[str, Any], manifest_dir: str, out_dir: str) -> Dict[s
     markup = _resolve(manifest_dir, entry.get("events_markup"))
     extended = _resolve(manifest_dir, entry.get("extended"))
     fps = float(entry.get("fps", 120.0))
-    # tracknet = 原方案；yolo = YOLO 主跟踪、TrackNet 只补 YOLO 丢球的帧（需要 yolo 观测）
+    # tracknet = 按方案（TrackNet 连续轨迹，有 yolo 观测时 YOLO 补 TrackNet 丢球的帧）；
+    # yolo = 试验：YOLO 主跟踪、TrackNet 只补 YOLO 丢球的帧（需要 yolo 观测）
     primary = str(entry.get("primary", "tracknet"))
-    deadline = int(entry.get("review_deadline_frames", 0))
-    latency = int(entry.get("review_latency_frames", 0))
+    # 方案 §4.1：超时按时间；旧清单里的 *_frames 按本视频 fps 换算成秒。
+    deadline = float(entry.get("review_deadline_s", entry.get("review_deadline_frames", 0) / fps))
+    latency = float(entry.get("review_latency_s", entry.get("review_latency_frames", 0) / fps))
     split = str(entry.get("split") or ("tuning" if name in ("test_2", "test2") else "holdout"))
 
     if not tracknet or not os.path.isfile(tracknet):
@@ -162,11 +164,12 @@ def _run_entry(entry: Dict[str, Any], manifest_dir: str, out_dir: str) -> Dict[s
                 ttnet_engine="auto", ttnet_device="cpu", ttnet_k=k)
         res = run(
             tracknet, preset=preset, quad=quad, reviewer=reviewer,
-            yolo_jsonl=yolo, review_latency_frames=latency,
-            review_deadline_frames=deadline,
+            yolo_jsonl=yolo, review_latency_s=latency,
+            review_deadline_s=deadline,
             pre_ctx=(8 - int(entry.get("ttnet_k", DEFAULT_K))) if reviewer == "ttnet" else 0,
             post_ctx=int(entry.get("ttnet_k", DEFAULT_K)) if reviewer == "ttnet" else 0,
             fps=fps, ttnet_args=tt_args, primary=primary,
+            yolo_recapture=bool(entry.get("yolo_recapture", True)),
         )
         write_outputs(run_dir, res)
         eval_prop = evaluate_proposals(run_dir, markup, tracknet, fps)

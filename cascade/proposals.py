@@ -58,18 +58,19 @@ class ProposalParams:
     hit_trigger: bool = False
     hit_min_vx: float = 300.0         # 水平速度反号且任一侧 |vx| >= 该值（px/s）
     dropout_trigger: bool = True
-    dropout_min_frames: int = 6       # 台面附近连续丢球多少帧
+    # 方案 §4.1：持续条件按时间戳，不按帧数。默认值在 120 fps 下与原来的 6 帧 / 3 帧等价。
+    dropout_min_s: float = 0.05       # 台面附近持续丢球多久（秒）
     disagree_trigger: bool = True     # 仅在给了 YOLO 观测时生效
     disagree_px: float = 40.0
-    disagree_min_frames: int = 3
+    disagree_min_s: float = 0.015     # YOLO 与 TrackNet 持续分歧多久（首末帧时间差，秒）
 
 
 class ProposalGenerator:
     def __init__(self, table_poly, frame_index: FrameIndex,
                  params: Optional[ProposalParams] = None, session_id: str = "s01") -> None:
         self.p = params or ProposalParams()
-        if self.p.dropout_min_frames > self.p.win or self.p.disagree_min_frames > self.p.win:
-            raise ValueError("dropout/disagree 触发帧数不能超过 win，否则违反前瞻上界")
+        if max(self.p.dropout_min_s, self.p.disagree_min_s) * self.p.fps > self.p.win:
+            raise ValueError("dropout/disagree 触发时长不能超过 win 帧对应的时间，否则违反前瞻上界")
         self.poly = np.asarray(table_poly, dtype=np.float32)
         self.index = frame_index
         self.session_id = session_id
@@ -203,7 +204,7 @@ class ProposalGenerator:
         if self._last_vis is None or self._gap_emitted:
             return None
         lf, lt, lx, ly = self._last_vis
-        if self.index.count_between(lf + 1, f) < self.p.dropout_min_frames:
+        if t - lt < self.p.dropout_min_s - 1e-6:
             return None
         self._gap_emitted = True
         sd = self.signed_dist(lx, ly)
@@ -220,7 +221,7 @@ class ProposalGenerator:
             self._dis_emitted = False
             return None
         self._dis_run.append((f, t))
-        if self._dis_emitted or len(self._dis_run) < self.p.disagree_min_frames:
+        if self._dis_emitted or t - self._dis_run[0][1] < self.p.disagree_min_s - 1e-6:
             return None
         self._dis_emitted = True
         f0, t0 = self._dis_run[0]
