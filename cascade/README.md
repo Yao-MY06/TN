@@ -21,11 +21,11 @@ python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl
 
 # 模拟复核耗时 30 帧：判罚不变，只是输出变晚
 python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl \
-    --preset test2 --review-latency-frames 30
+    --preset test2 --review-latency-s 0.25
 
 # 复核超过 60 帧仍未完成：记 timeout，迟到的结果只写 late_results.jsonl
 python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl \
-    --preset test2 --review-latency-frames 90 --review-deadline-frames 60
+    --preset test2 --review-latency-s 0.75 --review-deadline-s 0.5
 
 # 回归测试（57 项；没有 TTNet 权重时，需要权重的测试自动跳过）
 python -m unittest discover -s cascade/tests -t .
@@ -211,8 +211,8 @@ python -m cascade.ttnet_k_check --ttnet-cache _data/ttnet/test_2.jsonl --gt \
 
 ### 复核超时与人工确认（T2 / T3）
 
-- `--review-deadline-frames N`：片段提交后等待 N 帧；默认 0 表示不启用。正常完成优先于截止，
-  因此 `latency <= N` 与非截止运行逐项一致。超过截止时生成 `status="timeout"`、`reason="deadline_exceeded"` 的
+- `--review-deadline-s S`：片段提交后最多等待 S 秒（按时间戳，不按帧数）；默认 0 表示不启用。正常完成优先于截止，
+  因此 `latency <= S` 与非截止运行逐项一致。超过截止时生成 `status="timeout"`、`reason="deadline_exceeded"` 的
   空事件结果，水位线不再等待；原复核结果后来到达时只写入 `late_results.jsonl`，不交给状态机。
 - `summary.json` 新增 `timeout_count`、`timeout_ratio`、`late_result_count`、`manual_confirm_count`、
   `manual_confirm_ratio`、`unreviewable_count`、`missing_context_ratio`。
