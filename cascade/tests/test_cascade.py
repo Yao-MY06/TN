@@ -146,6 +146,35 @@ class TestLatencyInvariance(unittest.TestCase):
         self.assertEqual(res["referee"].dumped_events, base.dumped_events)
 
 
+class TestReviewDeadline(unittest.TestCase):
+    def test_completion_before_deadline_matches_no_deadline(self):
+        base = run(OBS, preset="test2", review_latency_frames=10)
+        limited = run(OBS, preset="test2", review_latency_frames=10,
+                      review_deadline_frames=20)
+        self.assertEqual(base["referee"].dumped_events, limited["referee"].dumped_events)
+        self.assertEqual(base["referee"].decisions, limited["referee"].decisions)
+        self.assertEqual([r.to_dict() for r in base["results"]],
+                         [r.to_dict() for r in limited["results"]])
+        self.assertEqual(limited["summary"]["timeout_count"], 0)
+        self.assertEqual(limited["late_results"], [])
+
+    def test_timeout_does_not_block_commit_and_late_events_are_ignored(self):
+        res = run(OBS, preset="test2", review_latency_frames=240,
+                  review_deadline_frames=30)
+        s = res["summary"]
+        self.assertGreater(s["timeout_count"], 0)
+        self.assertEqual(s["timeout_count"], len(res["late_results"]))
+        self.assertGreater(s["timeout_ratio"], 0.0)
+        self.assertEqual(s["reviews"].get("timeout"), s["timeout_count"])
+        timeout_ids = {r.clip_id for r in res["results"] if r.status == "timeout"}
+        late_ids = {r.clip_id for r in res["late_results"]}
+        self.assertEqual(timeout_ids, late_ids)
+        late_event_ids = {e["event_id"] for r in res["late_results"] for e in r.events}
+        committed_event_ids = {e["event_id"] for e in res["referee"].dumped_events}
+        self.assertTrue(late_event_ids)
+        self.assertFalse(late_event_ids & committed_event_ids)
+
+
 class TestConfigVariants(unittest.TestCase):
     def test_no_out_no_jitter_still_consistent(self):
         """关掉出界推断与抖动合并时，与 run_mixed 对应开关的结果一致。"""
