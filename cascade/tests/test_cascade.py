@@ -174,6 +174,61 @@ class TestReviewDeadline(unittest.TestCase):
         self.assertTrue(late_event_ids)
         self.assertFalse(late_event_ids & committed_event_ids)
 
+        queue = res["review_queue"]
+        timeout_rows = [row for row in queue if row["status"] == "timeout"]
+        self.assertEqual(len(timeout_rows), s["timeout_count"])
+        self.assertEqual(s["manual_confirm_count"], len(queue))
+        self.assertGreaterEqual(len(queue), s["timeout_count"])
+        for row in timeout_rows:
+            self.assertIn("deadline_exceeded", row["reason_codes"])
+            self.assertIsNotNone(row["start_frame_id"])
+            self.assertIsNotNone(row["end_frame_id"])
+
+
+class TestReviewQueue(unittest.TestCase):
+    def test_manual_statuses_include_range_reason_hump_and_nearby_decisions(self):
+        from types import SimpleNamespace
+        from cascade.review_queue import build_review_queue
+        from cascade.reviewers import ReviewResult
+        from cascade.scheduler import Clip
+
+        clips = [
+            Clip("s01:c0001", [], 1.0, 1.2, start_frame_id=120, end_frame_id=144),
+            Clip("s01:c0002", [], 5.0, 5.2, start_frame_id=600, end_frame_id=624),
+            Clip("s01:c0003", [], 8.0, 8.2, start_frame_id=960, end_frame_id=984),
+            Clip("s01:c0004", [], 9.0, 9.2, start_frame_id=1080, end_frame_id=1104),
+        ]
+        results = [
+            ReviewResult("s01:c0001", ["p1"], "uncertain", [], "off_table@1216",
+                         reviewer="ttnet"),
+            ReviewResult("s01:c0002", ["p2"], "error", [], "missing_context",
+                         reviewer="ttnet"),
+            ReviewResult("s01:c0003", ["p3"], "rejected", [], "no_hump", reviewer="ttnet"),
+            ReviewResult("s01:c0004", ["p4"], "timeout", [], "deadline_exceeded",
+                         reviewer="ttnet"),
+        ]
+        reviewer = SimpleNamespace(log=[
+            {"clip_id": "s01:c0001", "humps": [
+                {"start": 120, "end": 122, "peak_frame": 121, "peak": 0.72, "truncated": False},
+            ]},
+            {"clip_id": "s01:c0002", "reasons": ["missing_context"]},
+        ])
+        referee = SimpleNamespace(decision_records=[
+            {"virtual_t": 1.8, "real_t": 2.0, "winner": "A", "rule": "OUT", "text": "near"},
+            {"virtual_t": 7.0, "real_t": 7.1, "winner": "B", "rule": "OUT", "text": "far"},
+        ])
+        res = {"clips": clips, "results": results, "reviewer": reviewer, "referee": referee}
+        queue = build_review_queue(res)
+        self.assertEqual([row["clip_id"] for row in queue],
+                         ["s01:c0001", "s01:c0002", "s01:c0004"])
+        first = queue[0]
+        self.assertEqual(first["reason_codes"], ["off_table@1216"])
+        self.assertEqual(first["hump_peak"], {"frame": 121, "score": 0.72})
+        self.assertEqual([d["text"] for d in first["nearby_decisions"]], ["near"])
+        self.assertEqual(queue[1]["reason_codes"], ["missing_context"])
+        self.assertIsNone(queue[1]["hump_peak"])
+        self.assertEqual(queue[2]["status"], "timeout")
+
 
 class TestConfigVariants(unittest.TestCase):
     def test_no_out_no_jitter_still_consistent(self):
@@ -223,7 +278,13 @@ class TestExtendedGroundTruth(unittest.TestCase):
         strokes, endings = parse_game_json(EXT_GT)
         self.assertEqual((len(strokes), len(endings)), (29, 2))
         with tempfile.TemporaryDirectory() as tmp:
-            write_outputs(tmp, run(OBS, preset="test2"))
+            res = run(OBS, preset="test2")
+            write_outputs(tmp, res)
+            with open(os.path.join(tmp, "review_queue.jsonl"), encoding="utf-8") as f:
+                queue = [json.loads(line) for line in f if line.strip()]
+            self.assertEqual(len(queue), res["summary"]["manual_confirm_count"])
+            self.assertIn("manual_confirm_ratio", res["summary"])
+            self.assertIn("missing_context_ratio", res["summary"])
             r = evaluate(tmp, EXT_GT)
         self.assertEqual(r["points"]["correct"], 2)
         self.assertEqual(r["points"]["spurious_points"], [])
