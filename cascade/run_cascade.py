@@ -32,7 +32,7 @@ from cascade.calib import build_calib_from_quad  # noqa: E402
 from cascade.committer import CommitConfig, StreamingReferee  # noqa: E402
 from cascade.frame_index import FrameIndex  # noqa: E402
 from cascade.proposals import ProposalGenerator, ProposalParams  # noqa: E402
-from cascade.reviewers import OracleReviewer, RuleReviewer  # noqa: E402
+from cascade.reviewers import OracleReviewer, ReviewResult, RuleReviewer  # noqa: E402
 from cascade.scheduler import ClipScheduler  # noqa: E402
 from cascade.ttnet_reviewer import add_ttnet_args, build_ttnet_reviewer  # noqa: E402
 
@@ -59,9 +59,12 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
         reviewer: str = "rule", oracle_events: Optional[str] = None,
         yolo_jsonl: Optional[str] = None,
         params: Optional[ProposalParams] = None, commit: Optional[CommitConfig] = None,
-        review_latency_frames: int = 0, merge: bool = True, max_clip_s: float = 1.0,
+        review_latency_frames: int = 0, review_deadline_frames: int = 0,
+        merge: bool = True, max_clip_s: float = 1.0,
         pre_ctx: int = 0, post_ctx: int = 0, session_id: str = "s01",
         fps: float = 120.0, ttnet_args: Any = None) -> Dict[str, Any]:
+    if review_latency_frames < 0 or review_deadline_frames < 0:
+        raise ValueError("review latency/deadline frames must be >= 0")
     params = params or ProposalParams()
     commit = commit or CommitConfig()
     db = load_detect_bounce()
@@ -95,26 +98,62 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
         raise SystemExit(f"未知复核器: {reviewer}（TTNet 复核器在第 5 步接入）")
     ref = StreamingReferee(calib, commit)
 
-    proposals, results = [], []
-    inflight: List[tuple] = []           # (到期位置, clip, result)
+    proposals, results, late_results = [], [], []
+    # 每项：提交位置、模拟完成位置、截止位置、clip 和已经算出的结果。
+    # review() 在当前实现中是同步的；due_pos 模拟结果到达提交层的时间。
+    inflight: List[Dict[str, Any]] = []
 
     def earliest_event_t(c) -> float:
         a = min(p.anchor_timestamp_s for p in c.proposals) - rev.max_lead_s
         return max(c.start_timestamp_s, a)
 
     def deliver(pos: int, force: bool = False) -> None:
-        while inflight and (force or inflight[0][0] <= pos):
-            _, c, r = inflight.pop(0)
-            r.completed_frame_id = index.last_frame_id
-            results.append(r)
-            ref.add_bounces(r.events)
+        """交付到期结果；超时项合成 timeout，原结果稍后只写 late_results。"""
+        still: List[Dict[str, Any]] = []
+        for item in inflight:
+            c = item["clip"]
+            if item["timed_out"]:
+                # 迟到的真实结果绝不送状态机，只留作诊断。
+                if force or item["due_pos"] <= pos:
+                    r = item["result"]
+                    r.completed_frame_id = index.last_frame_id
+                    late_results.append(r)
+                else:
+                    still.append(item)
+                continue
+
+            if force or item["due_pos"] <= pos:
+                r = item["result"]
+                r.completed_frame_id = index.last_frame_id
+                results.append(r)
+                ref.add_bounces(r.events)
+                continue
+
+            deadline_pos = item["deadline_pos"]
+            if deadline_pos is not None and deadline_pos <= pos:
+                timeout = ReviewResult(
+                    c.clip_id, c.proposal_ids, "timeout", [], "deadline_exceeded",
+                    per_proposal={pid: "timeout:deadline_exceeded" for pid in c.proposal_ids},
+                    reviewer=rev.name, submitted_frame_id=c.submitted_frame_id,
+                    completed_frame_id=index.last_frame_id, n_windows=c.n_windows)
+                results.append(timeout)
+                item["timed_out"] = True
+                if force:
+                    item["result"].completed_frame_id = index.last_frame_id
+                    late_results.append(item["result"])
+                else:
+                    still.append(item)
+            else:
+                still.append(item)
+        inflight[:] = still
 
     def bounce_unknown_before() -> float:
         w = gen.min_future_anchor_t() - rev.max_lead_s
         for c in sched.open_clips():
             w = min(w, earliest_event_t(c))
-        for _, c, _ in inflight:
-            w = min(w, earliest_event_t(c))
+        for item in inflight:
+            if not item["timed_out"]:
+                w = min(w, earliest_event_t(item["clip"]))
         return w
 
     for pos, d in enumerate(raw):
@@ -133,7 +172,13 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
         proposals.extend(new)
         sched.add(new)
         for c in sched.poll(gen.min_future_anchor_t() - params.pre_s):
-            inflight.append((pos + review_latency_frames, c, rev.review(c)))
+            inflight.append({
+                "clip": c,
+                "result": rev.review(c),
+                "due_pos": pos + review_latency_frames,
+                "deadline_pos": pos + review_deadline_frames if review_deadline_frames else None,
+                "timed_out": False,
+            })
         deliver(pos)
         ref.advance(bounce_unknown_before())
 
@@ -141,7 +186,13 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
     proposals.extend(tail)
     sched.add(tail)
     for c in sched.poll(float("inf"), final=True):
-        inflight.append((len(raw), c, rev.review(c)))
+        inflight.append({
+            "clip": c,
+            "result": rev.review(c),
+            "due_pos": len(raw) + review_latency_frames,
+            "deadline_pos": len(raw) + review_deadline_frames if review_deadline_frames else None,
+            "timed_out": False,
+        })
     deliver(len(raw), force=True)
     ref.finish()
 
@@ -164,6 +215,10 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
                   "ttnet_windows": sched.total_windows(),
                   "ttnet_window_ratio": round(sched.total_windows() / max(1, len(raw)), 4)},
         "reviews": dict(Counter(r.status for r in results)),
+        "timeout_count": sum(r.status == "timeout" for r in results),
+        "timeout_ratio": round(sum(r.status == "timeout" for r in results)
+                               / max(1, len(sched.submitted)), 4),
+        "late_result_count": len(late_results),
         "bounces": {"confirmed": sum(len(r.events) for r in results),
                     "kept_after_jitter": len(ref.kept_bounces),
                     "jitter_dropped": [round(e.timestamp_s, 3) for e in ref.jitter_dropped]},
@@ -190,7 +245,7 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
     if isinstance(rev, OracleReviewer):
         summary["oracle_missed"] = [round(e["timestamp_s"], 3) for e in rev.missed()]
     return {"summary": summary, "proposals": proposals, "clips": sched.submitted,
-            "results": results, "referee": ref, "reviewer": rev}
+            "results": results, "late_results": late_results, "referee": ref, "reviewer": rev}
 
 
 def write_outputs(out_dir: str, res: Dict[str, Any]) -> None:
@@ -204,6 +259,7 @@ def write_outputs(out_dir: str, res: Dict[str, Any]) -> None:
     dump("proposals.jsonl", [p.to_dict() for p in res["proposals"]])
     dump("clips.jsonl", [c.to_dict() for c in res["clips"]])
     dump("reviews.jsonl", [r.to_dict() for r in res["results"]])
+    dump("late_results.jsonl", [r.to_dict() for r in res.get("late_results", [])])
     dump("events.jsonl", res["referee"].dumped_events)
     dump("decisions.jsonl", res["referee"].decision_records)
     if getattr(res.get("reviewer"), "name", "") == "ttnet":
@@ -260,6 +316,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--reviewer", default="rule", choices=["rule", "oracle", "ttnet"])
     ap.add_argument("--oracle-events", default=None)
     ap.add_argument("--review-latency-frames", type=int, default=0)
+    ap.add_argument("--review-deadline-frames", type=int, default=0,
+                    help="片段提交后等待复核的帧数；0=不启用（默认）")
     ap.add_argument("--no-merge", action="store_true")
     ap.add_argument("--max-clip-s", type=float, default=1.0)
     ap.add_argument("--pre-ctx", type=int, default=None,
@@ -293,7 +351,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     commit = CommitConfig(jitter_merge=not a.no_jitter_merge, use_out=not a.no_out,
                           state_machine=a.state_machine)
     res = run(a.jsonl, a.preset, a.quad, a.reviewer, a.oracle_events, a.yolo, params, commit,
-              a.review_latency_frames, merge=not a.no_merge, max_clip_s=a.max_clip_s,
+              a.review_latency_frames, a.review_deadline_frames,
+              merge=not a.no_merge, max_clip_s=a.max_clip_s,
               pre_ctx=a.pre_ctx, post_ctx=a.post_ctx,
               ttnet_args=a if a.reviewer == "ttnet" else None)
     if not a.quiet:
