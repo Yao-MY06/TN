@@ -24,6 +24,15 @@
 
 机器说明：**A = 原机**（RTX 5060、OpenTTGames 视频与原版标注、TN 目录 `E:\bc\xm\ppq`）；**B = 另一台**（`E:\20-项目\ppq\TN`，有 Extended 标注，无 GPU）。代码任务两台都能做。
 
+### 在 B 机（`E:\20-项目\ppq\TN`）实现时
+
+- **只做 T1–T5**；T6–T8 要视频和 GPU，留给原机。
+- 工作目录就是 `E:\20-项目\ppq\TN`，不用从 GitHub 拉。分支纪律：在 `feat/cascade` 上开发、提交，再把每个提交 `cherry-pick` 到 `fusion/three-way`，两边保持同步。仓库本地 git 配置已设成 Yao-MY06，直接 commit 即可。
+- 需要 Python ≥ 3.10，带 numpy、opencv-python、pandas；没有 torch 也行（TTNet 测试会自动跳过）。
+- 原机首跑的完整产出在 `outputs/cascade_step5/`（不进 git）：两组运行目录（含 `reviews.jsonl`、`ttnet_reviews.jsonl`、`clips.jsonl`、`summary.json`、`eval*.json`）、`k_check_test_2.json` 和原机回执。写 T3/T4/T5 时用它对照字段和预期数字。
+- **原机的全片 TTNet 缓存 `_data/ttnet/test_2.jsonl` 还没拷到 B 机。** 没有它时：T3、T5 先用测试里构造的分数验证逻辑；T4 的 rule 组可以在 B 机复现 0.842，ttnet 组的 0.871 和 T3、T5 的真实验收等缓存拷来后再补跑（放到 `TN/_data/ttnet/test_2.jsonl`；YOLO 观测放 `TN/_data/obs/yolo/test_2.jsonl`）。
+- 同一时间只让一个 AI 改这个文件夹。
+
 ### 代码（任一台，先做）
 
 **T1 新机位：从四角标定构造机位参数**
