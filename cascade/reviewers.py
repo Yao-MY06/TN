@@ -62,7 +62,7 @@ class RuleReviewer:
 
     def __init__(self, table_poly, fps: float = 120.0, min_drop: float = 15.0,
                  margin: float = 0.0, min_gap: int = 15, dead: float = 0.05,
-                 source: str = "tracknet") -> None:
+                 source: str = "tracknet", source_of=None) -> None:
         db = load_detect_bounce()
         self._db = db
         self.poly = np.asarray(table_poly, dtype=float)
@@ -73,6 +73,7 @@ class RuleReviewer:
         self.min_gap = int(min_gap)
         self.dead = float(dead)
         self.source = source
+        self.source_of = source_of      # frame_id -> 该帧球位置来自哪个模型（融合后逐帧不同）
         self._last_kept = -10 ** 9
         self._last_seen = -10 ** 9
         self._n_events = 0
@@ -111,7 +112,7 @@ class RuleReviewer:
                 side=side,
                 position_px=[f["x"], f["y"]],
                 confidence=None,
-                sources=[self.source],
+                sources=[(self.source_of(fr) if self.source_of else None) or self.source],
             ))
             self._n_events += 1
             per[p.proposal_id] = f"confirmed:{side}"

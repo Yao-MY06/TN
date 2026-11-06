@@ -135,7 +135,7 @@ class TestLatencyInvariance(unittest.TestCase):
         base = run(OBS, preset="test2")["referee"]
         for lat in (1, 37, 240):
             for merge in (True, False):
-                r = run(OBS, preset="test2", review_latency_frames=lat, merge=merge)["referee"]
+                r = run(OBS, preset="test2", review_latency_s=lat / 120, merge=merge)["referee"]
                 self.assertEqual(r.dumped_events, base.dumped_events, f"lat={lat} merge={merge}")
                 self.assertEqual(r.decisions, base.decisions, f"lat={lat} merge={merge}")
 
@@ -148,9 +148,9 @@ class TestLatencyInvariance(unittest.TestCase):
 
 class TestReviewDeadline(unittest.TestCase):
     def test_completion_before_deadline_matches_no_deadline(self):
-        base = run(OBS, preset="test2", review_latency_frames=10)
-        limited = run(OBS, preset="test2", review_latency_frames=10,
-                      review_deadline_frames=20)
+        base = run(OBS, preset="test2", review_latency_s=10 / 120)
+        limited = run(OBS, preset="test2", review_latency_s=10 / 120,
+                      review_deadline_s=20 / 120)
         self.assertEqual(base["referee"].dumped_events, limited["referee"].dumped_events)
         self.assertEqual(base["referee"].decisions, limited["referee"].decisions)
         self.assertEqual([r.to_dict() for r in base["results"]],
@@ -159,8 +159,8 @@ class TestReviewDeadline(unittest.TestCase):
         self.assertEqual(limited["late_results"], [])
 
     def test_timeout_does_not_block_commit_and_late_events_are_ignored(self):
-        res = run(OBS, preset="test2", review_latency_frames=240,
-                  review_deadline_frames=30)
+        res = run(OBS, preset="test2", review_latency_s=240 / 120,
+                  review_deadline_s=30 / 120)
         s = res["summary"]
         self.assertGreater(s["timeout_count"], 0)
         self.assertEqual(s["timeout_count"], len(res["late_results"]))
@@ -186,7 +186,7 @@ class TestReviewDeadline(unittest.TestCase):
 
     def test_deadline_also_applies_to_clips_pending_at_end_of_stream(self):
         """视频结束时还没复核完、且预计完成晚于截止的片段，也必须判 timeout。"""
-        res = run(OBS, preset="test2", review_latency_frames=240, review_deadline_frames=30)
+        res = run(OBS, preset="test2", review_latency_s=240 / 120, review_deadline_s=30 / 120)
         s = res["summary"]
         self.assertEqual(s["timeout_count"], s["clips"]["total"])
         self.assertEqual(set(s["reviews"]), {"timeout"})
@@ -196,8 +196,8 @@ class TestReviewDeadline(unittest.TestCase):
 
     def test_end_of_stream_within_deadline_is_delivered(self):
         """截止时间足够长时，结尾片段照常交付，结果与不设截止相同。"""
-        base = run(OBS, preset="test2", review_latency_frames=20)["referee"]
-        r = run(OBS, preset="test2", review_latency_frames=20, review_deadline_frames=60)
+        base = run(OBS, preset="test2", review_latency_s=20 / 120)["referee"]
+        r = run(OBS, preset="test2", review_latency_s=20 / 120, review_deadline_s=60 / 120)
         self.assertEqual(r["summary"]["timeout_count"], 0)
         self.assertEqual(r["referee"].dumped_events, base.dumped_events)
 
@@ -260,7 +260,7 @@ class TestConfigVariants(unittest.TestCase):
             with open(ev_path, encoding="utf-8") as f:
                 c1 = [json.loads(line) for line in f if line.strip()]
         r = run(OBS, preset="test2", commit=CommitConfig(jitter_merge=False, use_out=False),
-                review_latency_frames=50)["referee"]
+                review_latency_s=50 / 120)["referee"]
         self.assertEqual(r.dumped_events, c1)
 
     def test_strict_proposals_still_cover(self):

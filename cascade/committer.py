@@ -72,6 +72,7 @@ class StreamingReferee:
         self._last_visible_t: Optional[float] = None
         self._gap_open = False
         self.n_lowconf = 0
+        self.event_sources: Dict[str, List[str]] = {}
 
         # 落台：确认 → 抖动合并定稿 → 注入
         self._confirmed: List[Tuple[float, int, RefereeEvent]] = []   # 按时间排序，等待定稿
@@ -224,7 +225,12 @@ class StreamingReferee:
                 source.lockout_until = t + cfg.post_point_lockout
 
         n_inj_before = len(source.injected)
-        for ev in source.update(obs):
+        evs = source.update(obs)
+        injected = {id(e) for e in source.injected[n_inj_before:]}
+        for ev in evs:
+            if id(ev) not in injected:
+                # 轨迹层事件由本帧观测产生，来源 = 本帧球位置的模型（融合后逐帧不同，方案 §7.4）
+                ev.sources = [obs.source]
             self.counts[ev.type] += 1
             pos = None
             if ev.position_px is not None:
@@ -237,6 +243,8 @@ class StreamingReferee:
                 "position_px": list(pos) if pos else None,
                 "confidence": ev.confidence,
             })
+            # 与 run_mixed 的 --events-out 逐字段一致，来源另存（写 events.jsonl 时并入）
+            self.event_sources[ev.event_id] = list(ev.sources)
             self.log_lines.append(
                 f"  [帧 {obs.frame_id:04d} | {t:6.3f}s] 事件: {ev.type:<11} 半台: {ev.side:<7} ID: {ev.event_id}")
             for d in sm.update(ev):

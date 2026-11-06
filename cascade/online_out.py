@@ -111,5 +111,5 @@ class OnlineOutDetector:
             side="A" if x < self.net_x else "B",
             position_px=(float(x), float(y)),
             confidence=None,
-            sources=[self.source],
+            sources=[o.source or self.source],
         )

@@ -313,34 +313,31 @@ TTNet 依赖与 TN 的 venv 冲突时加 `-TTNetPython <另一个 python.exe>`�
    torch 对 numpy 的一致性仍待原机验证（本机没有 torch）。chagoup 的 WEIGHT_COMPARE_REPORT 称两份效果几乎一致。
 4. **真实分数下的 C2 / C3 对照**：落台 F1 要不低于 C1 和 C2，重复计分为 0，TTNet 窗口调用数要低于全量。
 
-## YOLO 主跟踪（`--primary yolo`）
+## YOLO 与 TrackNet 的观测融合（`fuse_obs.py`）
 
-按 YOLO（实时）→ TrackNet（实时提议）→ TTNet（区间检测）的顺序，最前面一层换成 YOLO：
+按级联方案 §1–§2：YOLO 实时定位，TrackNet 读连续图像给出连续轨迹，YOLO 在模型外辅助
+（候选关联、质量检查、重新捕获），不替代 TrackNet 的图像输入。给了 `--yolo` 时默认：
 
-- 每帧先用 YOLO 的球位置（置信度 ≥ 0.5，且前后 2 帧内有位置连得上的 YOLO 检出，否则视为误检）。
-- YOLO 没给出可用的球、并且最近 60 帧内见过球（回合进行中）时，才调用 TrackNet 补这一帧；
-  长时间没见到球 = 不在回合中，TrackNet 不跑。`--fill-window-frames -1` 表示 YOLO 一丢就调。
-- 融合后的观测流交给原来的提议层；区间调度、TTNet 复核、状态机不变。YOLO 已是主轨迹，
-  “YOLO/TrackNet 分歧”触发器不再使用。连续性门限要看后 2 帧，融合流晚 2 帧（17 ms）。
-- 代码在 `fuse_obs.py`，`summary.json` 的 `fusion` 字段给出 TrackNet 调用比例等统计。
-- 批量清单里给视频加 `"primary": "yolo"`（需要 `yolo` 观测）。
+- **重新捕获**：某帧 TrackNet 没看到球、而 YOLO 有可信检出时，用 YOLO 的位置补上。
+  可信 = 置信度 ≥ 0.5，且前后 0.017 s 内有位置连得上的 YOLO 检出（孤立跳点视为误检）。
+- **质量检查**：两者都看到但位置分歧 > 40 px 并持续 ≥ 0.015 s，提议层 `yolo_disagree` 触发复核。
+- 融合后仍是统一 Observation，每帧 `source` 标明球位置来自哪个模型；事件的 `sources`
+  也据此标注（`events.jsonl`），TTNet 确认的落台标为 `["ttnet", <证据来源>]`。
+- `--no-yolo-recapture` 关掉重新捕获（只保留分歧触发），用于复现旧结果。
+- `--primary yolo` 是试验选项：YOLO 主跟踪、回合中 YOLO 丢球（最近 `--fill-window-s` 秒内见过球）
+  才调 TrackNet，用来估算 TrackNet 能省多少算力。与方案中 TrackNet 的角色不同，不作默认。
 
-```bash
-python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl \
-    --yolo _data/obs/yolo/test_2.jsonl --primary yolo --preset test2 \
-    --reviewer ttnet --ttnet-cache _data/ttnet/test_2.jsonl --out-dir outputs/fusion_yolo/yolo_ttnet
-```
+所有持续/超时条件按时间戳（共用状态机方案 §4.1）：`--dropout-min-s`、`--review-latency-s`、
+`--review-deadline-s`、`--fill-window-s`；默认值在 120 fps 下与原来的帧数等价，7 段批量结果不变。
 
 test_2（调参视频，2026-11-07）：
 
-| 主跟踪 | 复核 | 落台 P / R / F1 | 得分方判对 | TrackNet 调用帧 |
+| 轨迹 | 复核 | 落台 P / R / F1 | 得分方判对 | TrackNet 调用帧 |
 |---|---|---|---|---|
-| TrackNet | 规则 | 0.828 / 0.857 / 0.842 | 2/2 | 100% |
-| TrackNet | TTNet | 0.794 / 0.964 / 0.871 | 2/2 | 100% |
-| YOLO | 规则 | 0.824 / 1.000 / 0.903 | 1/2 | 27% |
-| YOLO | TTNet | 0.800 / 1.000 / 0.889 | 1/2 | 27% |
-| 仅 YOLO（不补洞） | 规则 | 0.824 / 1.000 / 0.903 | 0/2 | 0% |
+| 仅 TrackNet | 规则 | 0.828 / 0.857 / 0.842 | 2/2 | 100% |
+| 仅 TrackNet | TTNet | 0.788 / 0.929 / 0.853 | 2/2 | 100% |
+| **TrackNet + YOLO 重新捕获（默认）** | **规则** | **0.824 / 1.000 / 0.903** | **2/2** | 100% |
+| TrackNet + YOLO 重新捕获（默认） | TTNet | 0.794 / 0.964 / 0.871 | 2/2 | 100% |
+| YOLO 主跟踪（试验） | 规则 | 0.824 / 1.000 / 0.903 | 1/2 | 27% |
 
-丢的那一分（9.45 s，A 下网）：球撞网弹回，水平速度反向，轨迹层把它当成 B 击球，
-之后的“落在自己半台”就不成立了。YOLO 在这里看到的帧更多，卡尔曼速度变号被检出；
-TrackNet 帧少，恰好没触发。这是状态机“水平反向 = 击球”的局限，不是融合层的问题。
+YOLO 主跟踪丢的一分（9.45 s，A 下网）：球撞网弹回，水平速度反向，轨迹层把它当成 B 击球。
