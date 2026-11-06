@@ -5,6 +5,7 @@
 > **还没有真实 TTNet 分数**，要等原机跑 `cascade/tools/run_machine_a.ps1`。YOLO 观测尚未生成。
 > 11-05：原机首跑完成，TTNet 复核把 test_2 落台召回从 0.857 提到 0.964，判罚不变（见「原机实测」）。
 > 11-04：核对了 chagoup 自训权重（与备用权重不是同一份）；新增 `--state-machine` 可选 TTNet1.1 状态机（默认不变）。
+> 11-06（B 机）：T1–T5 代码完成——四角构造标定、复核超时、人工确认清单、批量汇总、片段外漏检统计；真实 TTNet 缓存验收待原机数据。
 > 计划文档：《YOLO→TrackNet→TTNet 级联融合实施计划》
 
 只在外层包装：`tt/`、`adapter/`、`TrackNet/`、状态机交付件、另外两个仓库**一行未改**。
@@ -22,12 +23,17 @@ python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl
 python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl \
     --preset test2 --review-latency-frames 30
 
-# 回归测试（44 项；没有 TTNet 权重时，需要权重的测试自动跳过）
+# 复核超过 60 帧仍未完成：记 timeout，迟到的结果只写 late_results.jsonl
+python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl \
+    --preset test2 --review-latency-frames 90 --review-deadline-frames 60
+
+# 回归测试（57 项；没有 TTNet 权重时，需要权重的测试自动跳过）
 python -m unittest discover -s cascade/tests -t .
 ```
 
-`--out-dir` 下会写出 `proposals.jsonl`、`clips.jsonl`、`reviews.jsonl`、`events.jsonl`（格式同
-`run_mixed.py --events-out`）、`decisions.jsonl`、`log.txt`、`summary.json`。
+`--out-dir` 下会写出 `proposals.jsonl`、`clips.jsonl`、`reviews.jsonl`、`late_results.jsonl`、
+`review_queue.jsonl`、`events.jsonl`（格式同 `run_mixed.py --events-out`）、`decisions.jsonl`、
+`log.txt`、`summary.json`；TTNet 组另有 `ttnet_reviews.jsonl`。
 
 ## 模块
 
@@ -37,17 +43,24 @@ python -m unittest discover -s cascade/tests -t .
 | `online_bounce.py` | `detect_bounce.detect()` 的流式等价版（前瞻 12 帧），只找 y 局部极大 |
 | `proposals.py` | ProposalGenerator：局部极大（宽松阈值）、方向突变、台面附近丢球、YOLO 分歧四个触发器 |
 | `scheduler.py` | ClipScheduler：合并重叠提议、判断收口与上下文帧、统计 TTNet 窗口数 |
+| `calib.py` | 从 `calib/table_quads.json` 的四角构造新机位 `TableCalibration` |
 | `reviewers.py` | 复核器接口；`RuleReviewer`（C3a，离线严格阈值）、`OracleReviewer`（已知事件，上限分析） |
 | `online_out.py` | `run_mixed.derive_out_events` 的流式等价版 |
 | `committer.py` | 按事件时间提交：在滞后的虚拟时钟上原样执行 `run_mixed` 的主循环 |
 | `run_cascade.py` | 命令行入口与汇总 |
 | `eval_proposals.py` | 用 `events_markup.json` 算提议召回、漏提议明细、确认落台 P/R/F1（±5 / ±12 帧） |
+| `eval_ttnet_outside.py` | §7：全片 TTNet 驼峰中，峰值不落在任何复核片段内、且与真值落台 ±5 帧匹配的漏检 |
+| `review_queue.py` | 汇总 `uncertain` / `error` / `timeout` 片段，生成待人工确认清单 |
+| `run_batch.py` | 按清单批量跑 rule / ttnet，生成 `summary.md` / `summary.csv` 与 holdout 池化合计 |
 | `state_machines.py` | 计分状态机选择：`tn`（默认）或 TTNet1.1 的 `TTNetStateMachine` 两个档位 |
 | `ttnet_engine.py` | TTNet 单窗推理：`TorchEngine`（用 TTNet 仓库的 create_model，在外层兼容 CPU）/ `NumpyEngine`（不依赖 torch 的复刻，自带 .pth 读取） |
 | `ttnet_cache.py` | 视频 → 逐窗口 TTNet 分数 JSONL（原机用） |
 | `ttnet_reviewer.py` | `TTNetReviewer`：replay / live 两个后端，驼峰检测 + 印证判定 |
 | `ttnet_k_check.py` | 用真值核实事件对齐偏移 k |
 | `tools/run_machine_a.ps1` | 原机一键脚本 |
+
+`run_cascade.py` 的 `--preset` 若是 core 内置预设（`game2` / `rally` / `plos` / `test4` / `test2`）或
+`game4`，仍走 `run_mixed.build_calib`；其他新机位按 `--quad`（缺省由 preset 推出）从四角构造标定。
 
 ### 提交层为什么能保证"延迟不改判罚"
 
@@ -195,6 +208,47 @@ python -m cascade.ttnet_k_check --ttnet-cache _data/ttnet/test_2.jsonl --gt \
 ```
 
 `--out-dir` 下多一个 `ttnet_reviews.jsonl`（每个片段的驼峰、过网证据、原因码）。
+
+### 复核超时与人工确认（T2 / T3）
+
+- `--review-deadline-frames N`：片段提交后等待 N 帧；默认 0 表示不启用。正常完成优先于截止，
+  因此 `latency <= N` 与非截止运行逐项一致。超过截止时生成 `status="timeout"`、`reason="deadline_exceeded"` 的
+  空事件结果，水位线不再等待；原复核结果后来到达时只写入 `late_results.jsonl`，不交给状态机。
+- `summary.json` 新增 `timeout_count`、`timeout_ratio`、`late_result_count`、`manual_confirm_count`、
+  `manual_confirm_ratio`、`missing_context_ratio`。
+- `review_queue.jsonl` 只收 `uncertain` / `error` / `timeout`（`rejected` 不算），每条含 clip 时间/帧范围、
+  原因码、TTNet 最高驼峰、片段前后 1 秒内的判罚。
+
+### 批量运行与 §7 漏检（T4 / T5）
+
+清单是一个 JSON；相对路径相对清单文件解析：
+
+```json
+{"videos": [{
+  "name": "test_2", "split": "tuning", "preset": "test2", "quad": "test_2",
+  "tracknet": "_data/obs/tracknet/test_2.jsonl",
+  "yolo": "_data/obs/yolo/test_2.jsonl",
+  "ttnet_cache": "_data/ttnet/test_2.jsonl",
+  "events_markup": "_data/openttgames/test_annotations/test_2_extracted/events_markup.json",
+  "extended": "_data/gt/extended_openttgames/game_data/test/test_2.json"
+}]}
+```
+
+```bash
+python -m cascade.run_batch --manifest cascade/batch_manifest.json --out-dir outputs/cascade_batch
+```
+
+每个视频各跑 `_rule` / `_ttnet` 两组并接 `eval_proposals`、`eval_extended` 与
+`eval_ttnet_outside`。`summary.md` / `summary.csv` 每段一行；`split="holdout"` 的合计行按
+tp/fp/fn 汇总后重算 P/R/F1，不是平均各视频 F1。清单缺 TTNet 缓存时自动只跑 rule，并在备注列说明。
+
+单段 T5 也可直接跑：
+
+```bash
+python -m cascade.eval_ttnet_outside --ttnet-cache _data/ttnet/test_2.jsonl \
+    --clips outputs/cascade_batch/test_2_ttnet/clips.jsonl \
+    --events-markup <events_markup.json> --k 4 --out <输出.json>
+```
 
 **原机一键脚本**（PowerShell，路径都是参数）：
 
