@@ -27,13 +27,57 @@ python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl
 python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl \
     --preset test2 --review-latency-s 0.75 --review-deadline-s 0.5
 
-# 回归测试（57 项；没有 TTNet 权重时，需要权重的测试自动跳过）
+# 回归测试（75 项；没有 TTNet 权重时，需要权重的测试自动跳过）
 python -m unittest discover -s cascade/tests -t .
 ```
 
 `--out-dir` 下会写出 `proposals.jsonl`、`clips.jsonl`、`reviews.jsonl`、`late_results.jsonl`、
 `review_queue.jsonl`、`events.jsonl`（格式同 `run_mixed.py --events-out`）、`decisions.jsonl`、
 `log.txt`、`summary.json`；TTNet 组另有 `ttnet_reviews.jsonl`。
+
+## 实时层（简化版）
+
+实时层用视频文件模拟摄像头，并按每秒墙钟时间处理超时与持续时间：
+
+```text
+VideoFileCamera → FrameRing
+   ├─→ YOLO worker ────┐
+   └─→ TrackNet worker ┴→ 按 frame_id 汇合 + OnlineFusion(gate_s)
+                         → CascadeCore → TTNet 有界队列 → 状态机
+```
+
+无 GPU 的全回放：
+
+```bash
+python -m cascade.run_realtime --null-camera 3600 --fps 120 --pace all \
+    --yolo-replay _data/obs/yolo/test_2.jsonl \
+    --tracknet-replay adapter/examples/test_2_observations.jsonl \
+    --ttnet-cache _data/ttnet/test_2.jsonl --reviewer ttnet --preset test2 \
+    --ttnet-ms-per-window 0 --out-dir outputs/realtime/replay_all
+```
+
+原机真模型（视频输入）：
+
+```powershell
+python -m cascade.run_realtime --video <test_2.mp4> --pace realtime \
+    --yolo-weights E:\20-项目\ppq\pingpong-smart-referee\weights\yolo11n_clean_best.pt \
+    --tracknet-weights TrackNet\TrackNet\exps\tt_g345_aug\model_best.pt \
+    --ttnet-weights E:\20-项目\ppq\ttnet_3rd_phase_epoch_30.pth \
+    --ttnet-src ..\TTNet\src --reviewer ttnet --preset test2 \
+    --out-dir outputs/realtime/a_realtime
+```
+
+- `--pace all` 由有界输入队列形成背压，不丢帧；`--pace realtime` 按视频 fps / speed 吐帧，
+  worker 队列满时丢最旧帧并输出不可见观测，迟到结果若晚于 `--join-timeout-s` 会被忽略并计数。
+- TTNet 队列容量 `--ttnet-queue` 默认 8。队列满立即生成 `timeout / queue_full`，进人工确认清单；
+  `--review-deadline-s` 按墙钟秒判截止，迟到结果只进 `late_results.jsonl`。
+- 输出文件与 `run_cascade --out-dir` 相同，另写 `realtime_stats.json`：各阶段处理数/丢帧/帧率/耗时
+  p50/p95、队列深度、TTNet queue_full/missing_context/窗口数、Ring `evicted_before_read`、
+  判决端到端延迟 p50/p95/max 和总墙钟时间。
+- 帧环只保存 TTNet 的 320×128 RGB 小图，不保存原图；容量由 `--ring-s`（默认 3 s）按秒计算。
+
+test_2 全回放（sleep=0）与 `run_cascade` 的 proposals / clips / `events.jsonl`、判罚文本和比分逐项一致；
+规则复核落台 F1 0.903，TTNet 复核 0.871。
 
 ## 模块
 
@@ -52,6 +96,9 @@ python -m unittest discover -s cascade/tests -t .
 | `eval_ttnet_outside.py` | §7：全片 TTNet 驼峰中，峰值不落在任何复核片段内、且与真值落台 ±5 帧匹配的漏检 |
 | `review_queue.py` | 汇总 `uncertain` / `error` / `timeout` 片段，生成待人工确认清单 |
 | `run_batch.py` | 按清单批量跑 rule / ttnet，生成 `summary.md` / `summary.csv` 与 holdout 池化合计 |
+| `run_realtime.py` | 实时层入口：视频/空帧源、并行 YOLO/TrackNet/TTNet worker、有界队列与运行统计 |
+| `realtime/frames.py` | `Camera` / `VideoFileCamera` / `NullCamera` 与线程安全 320×128 帧环形缓存 |
+| `realtime/workers.py` | YOLO/TrackNet 逐帧 worker、TTNet 区间 worker；均支持无 GPU 的回放 sleep 模式 |
 | `state_machines.py` | 计分状态机选择：`tn`（默认）或 TTNet1.1 的 `TTNetStateMachine` 两个档位 |
 | `ttnet_engine.py` | TTNet 单窗推理：`TorchEngine`（用 TTNet 仓库的 create_model，在外层兼容 CPU）/ `NumpyEngine`（不依赖 torch 的复刻，自带 .pth 读取） |
 | `ttnet_cache.py` | 视频 → 逐窗口 TTNet 分数 JSONL（原机用） |

@@ -8,7 +8,7 @@ import unittest
 
 from cascade.eval_proposals import evaluate as evaluate_proposals
 from cascade.fuse_obs import FuseParams, OnlineFusion, fuse
-from cascade.realtime.frames import FrameRing
+from cascade.realtime.frames import FrameRing, VideoFileCamera
 from cascade.run_cascade import run as run_cascade, write_outputs
 from cascade.run_realtime import _build_parser, run_realtime
 
@@ -69,6 +69,27 @@ class TestFrameRing(unittest.TestCase):
         self.assertEqual(errors, [])
 
 
+class TestVideoFileCamera(unittest.TestCase):
+    def test_video_file_camera_all_pace(self):
+        import cv2
+        import numpy as np
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "clip.avi")
+            writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), 20.0, (64, 48))
+            if not writer.isOpened():
+                self.skipTest("cv2 VideoWriter(MJPG) 不可用")
+            for _ in range(5):
+                writer.write(np.zeros((48, 64, 3), dtype=np.uint8))
+            writer.release()
+            cam = VideoFileCamera(path, pace="all")
+            cam.start()
+            frames = list(cam.frames())
+            cam.stop()
+            self.assertEqual([f[0] for f in frames], list(range(5)))
+            self.assertAlmostEqual(frames[-1][1], 4 / 20.0, places=3)
+            self.assertEqual(frames[0][2].shape, (48, 64, 3))
+
+
 @unittest.skipUnless(os.path.isfile(YOLO), "缺 test_2 YOLO 观测")
 class TestOnlineFusion(unittest.TestCase):
     def test_matches_offline_per_frame(self):
@@ -117,6 +138,11 @@ class TestReplayConsistency(unittest.TestCase):
                 self.assertEqual(_event_rows(rt), _event_rows(base))
                 self.assertEqual(rt["summary"]["decisions"], base["summary"]["decisions"])
                 self.assertEqual(rt["summary"]["score"], base["summary"]["score"])
+                rt_dec = [{k: v for k, v in row.items() if k != "real_t"}
+                          for row in rt["referee"].decision_records]
+                base_dec = [{k: v for k, v in row.items() if k != "real_t"}
+                            for row in base["referee"].decision_records]
+                self.assertEqual(rt_dec, base_dec)
                 with tempfile.TemporaryDirectory() as tmp:
                     write_outputs(tmp, rt)
                     ev = evaluate_proposals(tmp, MARKUP, OBS, 120.0)
