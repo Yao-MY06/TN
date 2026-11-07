@@ -294,6 +294,12 @@ class TestExtendedGroundTruth(unittest.TestCase):
         from cascade.run_cascade import write_outputs
         strokes, endings = parse_game_json(EXT_GT)
         self.assertEqual((len(strokes), len(endings)), (29, 2))
+        # test_1、3～7 的 game_data 混有 bounce/net/empty_event 事件标签，不能算击球
+        t5 = os.path.join(os.path.dirname(EXT_GT), "test_5.json")
+        if os.path.isfile(t5):
+            s5, e5 = parse_game_json(t5)
+            self.assertEqual((len(s5), len(e5)), (27, 7))
+            self.assertTrue(all(s["side"] in ("A", "B") for s in s5))
         with tempfile.TemporaryDirectory() as tmp:
             res = run(OBS, preset="test2")
             write_outputs(tmp, res)
