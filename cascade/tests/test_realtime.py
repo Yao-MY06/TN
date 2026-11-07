@@ -163,9 +163,12 @@ class TestRealtimeDrop(unittest.TestCase):
             "--null-camera", "800", "--fps", "120", "--pace", "realtime", "--speed", "20",
             "--yolo-replay", YOLO, "--tracknet-replay", OBS,
             "--yolo-ms", "5", "--tracknet-ms", "42", "--tracknet-queue", "8",
-            "--reviewer", "rule", "--preset", "test2", "--quiet"])
+            "--join-timeout-s", "0.01", "--reviewer", "rule",
+            "--preset", "test2", "--quiet"])
         res = run_realtime(a)
         self.assertGreater(res["realtime_stats"]["stages"]["tracknet"]["dropped"], 0)
+        self.assertGreater(res["realtime_stats"]["join_timeouts"], 0)
+        self.assertGreater(res["realtime_stats"]["late_worker_results"], 0)
         self.assertIn("A", res["summary"]["score"])
         self.assertIn("B", res["summary"]["score"])
 
