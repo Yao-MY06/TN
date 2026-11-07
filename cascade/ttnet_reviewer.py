@@ -190,17 +190,20 @@ class ReplayScores:
     """读 ttnet_cache.py 产出的 JSONL。"""
     kind = 'replay'
 
-    def __init__(self, path_or_rows):
+    def __init__(self, path_or_rows, per_window_s=0.0):
         rows = load_jsonl(path_or_rows) if isinstance(path_or_rows, str) else list(path_or_rows)
         self.rows = {int(r['window_end']): r for r in rows if 'window_end' in r}
         self.used = set()
         self.infer_ms = []
+        self.per_window_s = max(0.0, float(per_window_s))
 
     def get(self, window_end):
         r = self.rows.get(int(window_end))
         if r is None:
             return None
         if window_end not in self.used:
+            if self.per_window_s:
+                time.sleep(self.per_window_s)
             self.used.add(window_end)
             if r.get('infer_ms') is not None:
                 self.infer_ms.append(float(r['infer_ms']))

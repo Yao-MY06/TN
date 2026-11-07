@@ -153,3 +153,130 @@ def fuse(yolo_obs: List[Dict[str, Any]], tracknet_obs: Optional[List[Dict[str, A
     stats["ball_visible_ratio"] = round((stats["yolo_used"] + stats["tracknet_used"]) / n, 4)
     stats["params"] = asdict(p)
     return out, stats
+
+class OnlineFusion:
+    """逐帧在线融合，延迟 ``gate_s`` 秒等待未来 YOLO 连续性证据。
+
+    调用方每帧同时提交该帧的 YOLO / TrackNet 观测（缺失的一路用不可见观测占位），
+    ``push`` 返回已经可以定稿的融合观测。时间比较全部用视频时间戳。
+    """
+
+    def __init__(self, params: Optional[FuseParams] = None) -> None:
+        self.p = params or FuseParams()
+        if self.p.primary not in ("tracknet", "yolo"):
+            raise ValueError(f"未知 primary: {self.p.primary}")
+        self._pending: Dict[int, Dict[str, Any]] = {}
+        self._yolo_dets: List[Tuple[float, int, Tuple[float, float]]] = []
+        self._yolo_has = set()
+        self._last_seen_t: Optional[float] = None
+        self.stats = {"primary": self.p.primary, "frames": 0, "tracknet_used": 0,
+                      "yolo_used": 0, "yolo_rejected": 0, "tracknet_called": 0,
+                      "no_ball": 0}
+
+    def _add_yolo(self, obs: Optional[Dict[str, Any]]) -> None:
+        if not obs:
+            return
+        fid = int(obs["frame_id"])
+        xy = _xy(obs)
+        if xy is None:
+            return
+        c = obs["ball"].get("confidence")
+        if c is not None and c < self.p.yolo_min_conf:
+            return
+        self._yolo_dets.append((float(obs["timestamp_s"]), fid, xy))
+        self._yolo_has.add(fid)
+        self._yolo_dets.sort(key=lambda x: x[0])
+
+    def _gate_ok(self, fid: int) -> bool:
+        target = self._pending.get(fid)
+        if target is None:
+            return False
+        t = float(target["timestamp_s"])
+        xy = _xy(target["yolo"])
+        if xy is None:
+            return False
+        c = target["yolo"]["ball"].get("confidence")
+        if c is not None and c < self.p.yolo_min_conf:
+            return False
+        x, y = xy
+        for tj, fj, (xj, yj) in self._yolo_dets:
+            if tj < t - self.p.gate_s - _EPS:
+                continue
+            if tj > t + self.p.gate_s + _EPS:
+                break
+            if fj != fid and math.hypot(x - xj, y - yj) <= self.p.gate_speed_px_s * abs(tj - t) + _EPS:
+                return True
+        return False
+
+    def push(self, frame_id: int, timestamp_s: float, yolo_obs: Optional[Dict[str, Any]],
+             tracknet_obs: Optional[Dict[str, Any]], now_t: Optional[float] = None) -> List[Dict[str, Any]]:
+        fid = int(frame_id)
+        self._pending[fid] = {"frame_id": fid, "timestamp_s": float(timestamp_s),
+                              "yolo": yolo_obs, "tracknet": tracknet_obs}
+        self._add_yolo(yolo_obs)
+        return self._drain(float(timestamp_s) if now_t is None else float(now_t), final=False)
+
+    def _drain(self, now_t: float, final: bool) -> List[Dict[str, Any]]:
+        ready_ids = sorted(fid for fid, row in self._pending.items()
+                           if final or row["timestamp_s"] <= now_t - self.p.gate_s + _EPS)
+        out = []
+        for fid in ready_ids:
+            row = self._pending[fid]
+            fused = self._fuse_one(row)
+            self._pending.pop(fid, None)
+            if fused is not None:
+                out.append(fused)
+        return out
+
+    def _fuse_one(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        fid = int(row["frame_id"])
+        yolo = row["yolo"]
+        tracknet = row["tracknet"]
+        if self.p.primary == "tracknet":
+            if tracknet is None:
+                return None
+            self.stats["frames"] += 1
+            self.stats["tracknet_called"] += 1
+            if _xy(tracknet) is not None:
+                self.stats["tracknet_used"] += 1
+                return tracknet
+            if self._gate_ok(fid):
+                self.stats["yolo_used"] += 1
+                return yolo
+            if fid in self._yolo_has:
+                self.stats["yolo_rejected"] += 1
+            self.stats["no_ball"] += 1
+            return tracknet
+
+        if yolo is None:
+            return None
+        self.stats["frames"] += 1
+        ts = float(yolo["timestamp_s"])
+        if self._gate_ok(fid):
+            self.stats["yolo_used"] += 1
+            self._last_seen_t = ts
+            return yolo
+        if fid in self._yolo_has:
+            self.stats["yolo_rejected"] += 1
+        in_rally = (self.p.fill_window_s is None
+                    or (self._last_seen_t is not None
+                        and ts - self._last_seen_t <= self.p.fill_window_s + _EPS))
+        if in_rally and tracknet is not None:
+            self.stats["tracknet_called"] += 1
+        if in_rally and tracknet is not None and _xy(tracknet) is not None:
+            self.stats["tracknet_used"] += 1
+            self._last_seen_t = ts
+            return tracknet
+        self.stats["no_ball"] += 1
+        return _invisible(fid, ts, yolo.get("image_size"), "yolo")
+
+    def flush(self) -> List[Dict[str, Any]]:
+        return self._drain(float("inf"), final=True)
+
+    def finish_stats(self) -> Dict[str, Any]:
+        out = dict(self.stats)
+        n = max(1, out["frames"])
+        out["tracknet_call_ratio"] = round(out["tracknet_called"] / n, 4)
+        out["ball_visible_ratio"] = round((out["yolo_used"] + out["tracknet_used"]) / n, 4)
+        out["params"] = asdict(self.p)
+        return out
