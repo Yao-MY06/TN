@@ -29,6 +29,10 @@ from core.state_machine import MatchRules, TableTennisStateMachine  # noqa: E402
 from core.trajectory_processor import TrajectoryEventProcessor  # noqa: E402
 
 _EPS = 1e-6
+NET_HALF_WIDTH_PX = 30.0
+NET_HOLD_AFTER_S = 0.15
+NET_RETURN_S = 0.30
+NET_ESCAPE_FACTOR = 2.0
 
 
 @dataclass
@@ -50,6 +54,9 @@ class CommitConfig:
     serve_guard_lookback: float = 0.45
     serve_guard_max_hole: float = 0.08
     keep_inner_bounce: bool = False
+    # 网附近反向击球：扣住网带内、NET_TOUCH 后 0.15 s 内的 RACKET_HIT，
+    # 用之后 0.3 s 的融合轨迹裁决；默认关闭。
+    net_hit_hold: bool = False
     # 计分状态机：tn（默认，与 run_mixed 一致）/ ttnet11-yolo / ttnet11-ttnet，见 state_machines.py
     state_machine: str = "tn"
 
@@ -95,6 +102,18 @@ class StreamingReferee:
         self._last_virtual_t = float("-inf")
         self._finished = False
 
+        # 网附近反向击球：NET_TOUCH 回调、被扣住的同帧事件序列与裁决记录。
+        self.event_callback = None
+        self._last_net_touch_t: Optional[float] = None
+        self._held_batch: Optional[Dict[str, Any]] = None
+        self.net_adjudications: List[Dict[str, Any]] = []
+
+    def held_hit_watermark(self) -> float:
+        """未裁决的网带击球必须压住虚拟水位线。"""
+        if self._held_batch is None:
+            return float("inf")
+        return float(self._held_batch["events"][0].timestamp_s)
+
     # ------------------------------------------------------------------ 真实侧
     def push_frame(self, raw: FrameObservation) -> None:
         self._now_t = raw.timestamp_s
@@ -133,6 +152,9 @@ class StreamingReferee:
     # ------------------------------------------------------------------ 推进
     def advance(self, bounce_unknown_before_t: float) -> None:
         """``bounce_unknown_before_t``：尚未确认的落台，其时间戳不会早于这个值。"""
+        if self._held_batch is not None:
+            if not self._try_resolve_held():
+                return
         # 1) 落台定稿：早于下界的已全部确认，可以按时间顺序做抖动合并
         while self._confirmed and self._confirmed[0][0] + 1e-9 < bounce_unknown_before_t:
             _, _, ev = self._confirmed.pop(0)
@@ -150,8 +172,12 @@ class StreamingReferee:
         while self._vqueue and self._vqueue[0][0].timestamp_s < limit:
             obs, _ = self._vqueue.popleft()
             self._virtual_frame(obs)
+            if self._held_batch is not None and not self._try_resolve_held():
+                break
 
     def finish(self) -> None:
+        if self._held_batch is not None:
+            self._try_resolve_held(force=True)
         if self.out_det is not None:
             self.out_det.finish()
         self.advance(float("inf"))
@@ -209,7 +235,7 @@ class StreamingReferee:
                 inner, [], drop_inner=not cfg.keep_inner_bounce, delay_s=cfg.bounce_delay, sm=sm,
                 dropouts=None, serve_guard_lookback=cfg.serve_guard_lookback,
                 serve_guard_max_hole=cfg.serve_guard_max_hole)
-            self.source.dropouts = self._dropouts          # 共享同一个列表，增量更新可见
+            self.source.dropouts = self._dropouts
             for item in self._staged:
                 self._insert_pending(item)
             self._staged = []
@@ -226,34 +252,123 @@ class StreamingReferee:
 
         n_inj_before = len(source.injected)
         evs = source.update(obs)
-        injected = {id(e) for e in source.injected[n_inj_before:]}
+        injected_ids = {id(e) for e in source.injected[n_inj_before:]}
         for ev in evs:
-            if id(ev) not in injected:
-                # 轨迹层事件由本帧观测产生，来源 = 本帧球位置的模型（融合后逐帧不同，方案 §7.4）
-                ev.sources = [obs.source]
-            self.counts[ev.type] += 1
-            pos = None
-            if ev.position_px is not None:
-                pos = (round(float(ev.position_px[0]), 1), round(float(ev.position_px[1]), 1))
-            self.dumped_events.append({
-                "event_id": ev.event_id,
-                "timestamp_s": round(float(ev.timestamp_s), 6),
-                "type": ev.type,
-                "side": ev.side,
-                "position_px": list(pos) if pos else None,
-                "confidence": ev.confidence,
-            })
-            # 与 run_mixed 的 --events-out 逐字段一致，来源另存（写 events.jsonl 时并入）
-            self.event_sources[ev.event_id] = list(ev.sources)
-            self.log_lines.append(
-                f"  [帧 {obs.frame_id:04d} | {t:6.3f}s] 事件: {ev.type:<11} 半台: {ev.side:<7} ID: {ev.event_id}")
-            for d in sm.update(ev):
-                self._record_decision(obs, t, d)
-                source.out_lockout_until = t + cfg.out_after_point_guard
-                if cfg.post_point_lockout > 0:
-                    source.lockout_until = t + cfg.post_point_lockout
-        for ev in source.injected[n_inj_before:]:
+            if ev.type == EventType.NET_TOUCH.value:
+                self._last_net_touch_t = float(ev.timestamp_s)
+                if self.event_callback is not None:
+                    self.event_callback(ev)
+        if evs:
+            self._process_event_batch(evs, obs, t, injected_ids)
+
+    def _is_hold_candidate(self, ev: RefereeEvent) -> bool:
+        if (not self.cfg.net_hit_hold or self.event_callback is None
+                or ev.type != EventType.RACKET_HIT.value):
+            return False
+        if ev.side not in ("A", "B") or ev.position_px is None:
+            return False
+        if self._last_net_touch_t is None:
+            return False
+        dt = float(ev.timestamp_s) - self._last_net_touch_t
+        if dt < -_EPS or dt > NET_HOLD_AFTER_S + _EPS:
+            return False
+        return abs(float(ev.position_px[0]) - float(self.calib.net_x)) <= NET_HALF_WIDTH_PX + _EPS
+
+    def _process_event_batch(self, events: List[RefereeEvent], obs: FrameObservation,
+                             t: float, injected_ids: set[int]) -> None:
+        for i, ev in enumerate(events):
+            if self._is_hold_candidate(ev):
+                self._held_batch = {
+                    "events": list(events[i:]), "obs": obs, "t": t,
+                    "injected_ids": set(injected_ids),
+                }
+                self._try_resolve_held()
+                return
+            self._emit_event(ev, obs, t, injected_ids)
+
+    def _emit_event(self, ev: RefereeEvent, obs: FrameObservation, t: float,
+                    injected_ids: set[int]) -> None:
+        cfg, sm = self.cfg, self.sm
+        if id(ev) not in injected_ids:
+            ev.sources = [obs.source]
+        self.counts[ev.type] += 1
+        pos = None
+        if ev.position_px is not None:
+            pos = (round(float(ev.position_px[0]), 1), round(float(ev.position_px[1]), 1))
+        self.dumped_events.append({
+            "event_id": ev.event_id,
+            "timestamp_s": round(float(ev.timestamp_s), 6),
+            "type": ev.type,
+            "side": ev.side,
+            "position_px": list(pos) if pos else None,
+            "confidence": ev.confidence,
+        })
+        self.event_sources[ev.event_id] = list(ev.sources)
+        self.log_lines.append(
+            f"  [帧 {obs.frame_id:04d} | {t:6.3f}s] 事件: {ev.type:<11} 半台: {ev.side:<7} ID: {ev.event_id}")
+        for d in sm.update(ev):
+            self._record_decision(obs, t, d)
+            self.source.out_lockout_until = t + cfg.out_after_point_guard
+            if cfg.post_point_lockout > 0:
+                self.source.lockout_until = t + cfg.post_point_lockout
+        if id(ev) in injected_ids:
             self.release_lag.append((ev.event_id, ev.timestamp_s, self._now_t))
+
+    def _try_resolve_held(self, force: bool = False) -> bool:
+        """返回是否已裁决。帧不够且非收尾时继续扣住。"""
+        held = self._held_batch
+        if held is None:
+            return True
+        decision, reason = self._adjudicate_held(held, force=force)
+        if decision is None:
+            return False
+        hit = held["events"][0]
+        events = list(held["events"])
+        if decision == "reverse":
+            events = events[1:]
+        sources = list(hit.sources)
+        if decision in ("reverse", "uncertain") and "suspect_net" not in sources:
+            sources.append("suspect_net")
+        self.net_adjudications.append({
+            "event_id": hit.event_id,
+            "timestamp_s": round(float(hit.timestamp_s), 6),
+            "side": hit.side,
+            "position_px": list(hit.position_px) if hit.position_px else None,
+            "decision": decision,
+            "reason": reason,
+            "sources": sources,
+        })
+        for ev in events:
+            self._emit_event(ev, held["obs"], held["t"], held["injected_ids"])
+        self._held_batch = None
+        return True
+
+    def _adjudicate_held(self, held: Dict[str, Any], force: bool = False) -> Tuple[Optional[str], str]:
+        hit = held["events"][0]
+        hit_t = float(hit.timestamp_s)
+        end_t = hit_t + NET_RETURN_S
+        if not force and (self._now_t is None or self._now_t + _EPS < end_t):
+            return None, "window_not_arrived"
+        # 用尚未交给虚拟时钟的融合观测做裁决；扣住期间它们不会被消费。
+        interval = [(o, t) for o, t in self._vqueue
+                    if hit_t - _EPS <= float(o.timestamp_s) <= end_t + _EPS]
+        if not force and not any(float(o.timestamp_s) >= end_t - _EPS for o, _ in interval):
+            return None, "frame_window_incomplete"
+        if len(interval) < 2:
+            return "uncertain", "frame_window_incomplete"
+        direction = 1.0 if hit.side == "A" else -1.0
+        hit_y = float(hit.position_px[1]) if hit.position_px else None
+        visible = []
+        for o, _ in interval:
+            if o.ball.visible and o.ball.center_px is not None:
+                visible.append((float(o.ball.center_px[0]), float(o.ball.center_px[1])))
+        if not visible:
+            return "uncertain", "no_visible_trajectory_after_net_touch"
+        escaped = [(x, y) for x, y in visible
+                   if direction * (x - float(self.calib.net_x)) > NET_ESCAPE_FACTOR * NET_HALF_WIDTH_PX]
+        if hit_y is not None and any(y < hit_y - _EPS for _, y in escaped):
+            return "released", "true_hit_moves_away_and_rises"
+        return "reverse", "no_escape_and_rise_after_net_touch"
 
     def _record_decision(self, obs, t: float, d) -> None:
         text = d.describe()

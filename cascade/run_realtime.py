@@ -7,7 +7,6 @@ import json
 import os
 import sys
 import time
-from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -65,9 +64,10 @@ def run_realtime(args) -> Dict[str, Any]:
                             table_margin_px=args.table_margin_px,
                             hit_trigger=args.hit_trigger,
                             dropout_trigger=not args.no_dropout_trigger,
-                            dropout_min_s=args.dropout_min_s)
+                            dropout_min_s=args.dropout_min_s,
+                            net_trigger=args.net_hit_hold)
     commit = CommitConfig(jitter_merge=not args.no_jitter_merge, use_out=not args.no_out,
-                          state_machine=args.state_machine)
+                          state_machine=args.state_machine, net_hit_hold=args.net_hit_hold)
     fp = FuseParams(primary=args.primary, yolo_min_conf=args.yolo_min_conf,
                     gate_s=args.fuse_gate_s,
                     fill_window_s=None if args.fill_window_s < 0 else args.fill_window_s)
@@ -198,6 +198,13 @@ def run_realtime(args) -> Dict[str, Any]:
         if args.review_deadline_s:
             active_deadlines[clip.clip_id] = time.monotonic() + args.review_deadline_s
 
+    def handle_clips(clips) -> None:
+        for clip in clips:
+            if args.reviewer == "rule":
+                core.on_result(clip.clip_id, reviewer.review(clip), last_video_t)
+            else:
+                submit_ttnet(clip)
+
     def process_fused(fused: Dict[str, Any], yolo_raw) -> None:
         nonlocal last_video_t
         fid = int(fused["frame_id"])
@@ -207,13 +214,8 @@ def run_realtime(args) -> Dict[str, Any]:
         evidence = [fused] + ([yolo_raw] if yolo_raw is not None else [])
         for fid_, dets in detections_from_observations(evidence).items():
             detections.setdefault(fid_, []).extend(dets)
-        ready = core.on_frame(fused, yolo_raw)
-        for clip in ready:
-            if args.reviewer == "rule":
-                core.on_result(clip.clip_id, reviewer.review(clip), last_video_t)
-            else:
-                submit_ttnet(clip)
-        core.advance(last_video_t)
+        handle_clips(core.on_frame(fused, yolo_raw))
+        handle_clips(core.advance(last_video_t))
         record_decisions()
 
     def emit_join(force: bool = False) -> None:
@@ -259,7 +261,7 @@ def run_realtime(args) -> Dict[str, Any]:
             if now >= deadline:
                 core.on_timeout(cid, last_video_t, reason="deadline_exceeded")
                 active_deadlines.pop(cid, None)
-        core.advance(last_video_t)
+        handle_clips(core.advance(last_video_t))
         record_decisions()
 
     camera.start()
@@ -299,12 +301,8 @@ def run_realtime(args) -> Dict[str, Any]:
     emit_join(force=True)
     for obs in online.flush():
         process_fused(obs, None)
-    for clip in core.flush():
-        if args.reviewer == "rule":
-            core.on_result(clip.clip_id, reviewer.review(clip), last_video_t)
-        else:
-            submit_ttnet(clip)
-    core.advance(last_video_t)
+    handle_clips(core.flush())
+    handle_clips(core.advance(last_video_t))
     record_decisions()
 
     if ttnet_worker is not None:
@@ -317,7 +315,7 @@ def run_realtime(args) -> Dict[str, Any]:
         for cid, result, wall in ttnet_worker.drain():
             core.on_result(cid, result, last_video_t)
             submitted_tasks.discard(cid)
-        core.advance(last_video_t)
+        handle_clips(core.advance(last_video_t))
         record_decisions()
 
     res = core.finish()
@@ -390,6 +388,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--quad")
     ap.add_argument("--primary", choices=["tracknet", "yolo"], default="tracknet")
     ap.add_argument("--no-yolo-recapture", action="store_true")
+    ap.add_argument("--net-hit-hold", action="store_true")
     ap.add_argument("--yolo-min-conf", type=float, default=0.5)
     ap.add_argument("--fill-window-s", type=float, default=0.5)
     ap.add_argument("--fuse-gate-s", type=float, default=0.017)

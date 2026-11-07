@@ -4,7 +4,8 @@
     "相对路径相对本文件所在目录（cascade/）解析。test_2 为调参视频（tuning），其余为留出验证（holdout），留出视频不得调参。",
     "events_markup 用原机的原版 OpenTTGames 标注；拿不到时 test_2 可临时用 ../_data/gt/extended_openttgames/inferred/test_2_events_markup_inferred.json（已验证可复现 TN 报告数字）。",
     "quad 是 calib/table_quads.json 里的键：test_1、3～7 要先标四角（PLAN_week_1106.md 的 T6）。test_4 有内置预设 test4，但四角键是 test_4，必须显式写 quad。",
-    "ttnet_cache 缺省时该视频只跑 rule 组；yolo 可选。"
+    "ttnet_cache 缺省时该视频只跑 rule 组；yolo 可选。",
+    "net_hit_hold=true 开启 NET_TOUCH 网异常提议 + 网带击球扣留/裁决（默认关闭）；net_trigger=true 仅用于消融触发层。"
   ],
   "videos": [
     {

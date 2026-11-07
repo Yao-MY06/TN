@@ -77,7 +77,13 @@ class ClipScheduler:
             self.stats["proposals"] += 1
             target = None
             if self.merge:
+                p_net_only = bool(p.reasons and all(r == "net_anomaly" for r in p.reasons))
                 for c in self._open:
+                    c_net_only = bool(c.proposals and all(
+                        q.reasons and all(r == "net_anomaly" for r in q.reasons)
+                        for q in c.proposals))
+                    if p_net_only != c_net_only:
+                        continue
                     overlap = p.start_timestamp_s <= c.end_timestamp_s and p.end_timestamp_s >= c.start_timestamp_s
                     span = max(c.end_timestamp_s, p.end_timestamp_s) - min(c.start_timestamp_s, p.start_timestamp_s)
                     if overlap and span <= self.max_clip_s + 1e-9:

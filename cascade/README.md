@@ -27,7 +27,7 @@ python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl
 python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl \
     --preset test2 --review-latency-s 0.75 --review-deadline-s 0.5
 
-# 回归测试（75 项；没有 TTNet 权重时，需要权重的测试自动跳过）
+# 回归测试（88 项；没有 TTNet 权重时，需要权重的测试自动跳过）
 python -m unittest discover -s cascade/tests -t .
 ```
 
@@ -83,6 +83,32 @@ python -m cascade.run_realtime --video <test_2.mp4> --pace realtime \
 
 test_2 全回放（sleep=0）与 `run_cascade` 的 proposals / clips / `events.jsonl`、判罚文本和比分逐项一致；
 规则复核落台 F1 0.903，TTNet 复核 0.871。
+
+## 网附近异常：NET_TOUCH 触发 + 网带击球扣留（默认关闭）
+
+`--net-hit-hold` 同时开启两个默认关闭的能力：
+
+1. **6.2 提议**：核心轨迹层实际发出 `NET_TOUCH` 时生成 `net_anomaly` 提议，区间固定为
+   `[t_net - 0.1 s, t_net + 0.3 s]`，不再另做一套几何检测。只开触发的消融键是清单字段
+   `"net_trigger": true`。
+2. **6.3 扣住与裁决**：committer 拦截同时满足以下条件的 `RACKET_HIT`：
+   `|x - calib.net_x| <= 30 px`，且距离最近 `NET_TOUCH` 不超过 `0.15 s`。扣住期间水位线不前进。
+   随后在固定 `0.3 s` 窗口内看融合轨迹：球向击球方向离网超过 `60 px`（2 倍带宽）且 y 变小，
+   才按原时间戳放行；否则撤销该击球。帧不足或看不到球时放行并进人工确认。
+
+这些数值是 6.3 预注册值，不在留出集上调整。撤销事件在 `summary.json.net_hit_hold.events`
+和 `review_queue.jsonl` 中可查；人工清单类别为 `net_reversal`。net_anomaly 专用片段不与普通提议
+交叉合并，也不会被通用 bounce 复核误当成落台。
+
+```bash
+python -m cascade.run_cascade --jsonl _data/obs/tracknet/test_4.jsonl \
+    --preset test4 --quad test_4 --reviewer rule --net-hit-hold \
+    --out-dir outputs/net_diag/test_4_hold
+```
+
+`run_batch` 清单项支持 `"net_hit_hold": true`，以及仅用于消融的 `"net_trigger": true`。
+3.3 网附近丢球专项没有实现（诊断 B 类为 0）。对打中的 `NET_TOUCH` 仍由共用状态机忽略；
+发球阶段 `NET_TOUCH -> LET` 的风险属于状态机缺口，cascade 层不绕过它自行判分。
 
 ## 模块
 

@@ -62,7 +62,10 @@ class ProposalParams:
     dropout_min_s: float = 0.05       # 台面附近持续丢球多久（秒）
     disagree_trigger: bool = True     # 仅在给了 YOLO 观测时生效
     disagree_px: float = 40.0
-    disagree_min_s: float = 0.015     # YOLO 与 TrackNet 持续分歧多久（首末帧时间差，秒）
+    disagree_min_s: float = 0.015    # YOLO 与 TrackNet 持续分歧多久（首末帧时间差，秒）
+    # 网附近异常：仅由核心轨迹层实际发出的 NET_TOUCH 触发，默认关闭。
+    net_trigger: bool = False
+     # YOLO 与 TrackNet 持续分歧多久（首末帧时间差，秒）
 
 
 class ProposalGenerator:
@@ -78,8 +81,9 @@ class ProposalGenerator:
         self._n = 0
         self._done = False
         self.stats: Dict[str, int] = {"local_y_max": 0, "direction_change": 0,
-                                      "dropout": 0, "yolo_disagree": 0,
+                                      "dropout": 0, "yolo_disagree": 0, "net_anomaly": 0,
                                       "localmax_seen": 0}
+        self._last_net_trigger_t: Optional[float] = None
         # 方向突变：最近两个真实检出
         self._prev_det: List[Tuple[int, float, float, float]] = []   # (f, t, x, y)
         # 丢球
@@ -139,6 +143,35 @@ class ProposalGenerator:
             if p is not None:
                 out.append(p)
         return out
+
+    def add_net_anomaly(self, timestamp_s: float) -> Optional[Proposal]:
+        """核心已发 NET_TOUCH → 生成网附近异常提议（默认关闭）。"""
+        if not self.p.net_trigger:
+            return None
+        t = float(timestamp_s)
+        if self._last_net_trigger_t is not None and abs(t - self._last_net_trigger_t) < 1e-6:
+            return None
+        self._last_net_trigger_t = t
+        fid = self.index.last_at_or_before(t)
+        if fid is None:
+            fid = int(round(t * self.p.fps))
+        self._n += 1
+        self.stats["net_anomaly"] += 1
+        now_f = self._now_frame if self._now_frame is not None else fid
+        now_t = self.index.time_of(now_f) if self.index.has(now_f) else t
+        return Proposal(
+            proposal_id=f"{self.session_id}:p{self._n:04d}",
+            session_id=self.session_id,
+            anchor_frame_id=fid,
+            anchor_timestamp_s=t,
+            start_timestamp_s=t - 0.1,
+            end_timestamp_s=t + 0.3,
+            candidate_types=["NET", "HIT", "BOUNCE", "UNKNOWN"],
+            reasons=["net_anomaly"],
+            created_frame_id=now_f,
+            created_timestamp_s=now_t,
+            features={"net_timestamp_s": t, "source": "core_NET_TOUCH"},
+        )
 
     def flush(self) -> List[Proposal]:
         out = [p for p in (self._from_localmax(lm) for lm in self.localmax.flush()) if p is not None]

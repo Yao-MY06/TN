@@ -170,6 +170,8 @@ def _run_entry(entry: Dict[str, Any], manifest_dir: str, out_dir: str) -> Dict[s
             post_ctx=int(entry.get("ttnet_k", DEFAULT_K)) if reviewer == "ttnet" else 0,
             fps=fps, ttnet_args=tt_args, primary=primary,
             yolo_recapture=bool(entry.get("yolo_recapture", True)),
+            net_hit_hold=bool(entry.get("net_hit_hold", False)),
+            net_trigger=bool(entry.get("net_trigger", False)),
         )
         write_outputs(run_dir, res)
         eval_prop = evaluate_proposals(run_dir, markup, tracknet, fps)
