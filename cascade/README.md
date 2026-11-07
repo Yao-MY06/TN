@@ -67,10 +67,15 @@ python -m cascade.run_realtime --video <test_2.mp4> --pace realtime \
     --out-dir outputs/realtime/a_realtime
 ```
 
-- `--pace all` 由有界输入队列形成背压，不丢帧；`--pace realtime` 按视频 fps / speed 吐帧，
-  worker 队列满时丢最旧帧并输出不可见观测，迟到结果若晚于 `--join-timeout-s` 会被忽略并计数。
-- TTNet 队列容量 `--ttnet-queue` 默认 8。队列满立即生成 `timeout / queue_full`，进人工确认清单；
-  `--review-deadline-s` 按墙钟秒判截止，迟到结果只进 `late_results.jsonl`。
+- `--pace all` 由有界队列形成背压，**不丢帧、不丢复核**：TTNet 队列满时主线程等待（同时回收已完成结果），
+  结果与 `run_cascade` 同步回放逐条一致。`--pace realtime` 按视频 fps / speed 吐帧，worker 队列满时
+  丢最旧帧并输出不可见观测，迟到结果若晚于 `--join-timeout-s` 会被忽略并计数。
+- 输入队列 `--yolo-queue` / `--tracknet-queue` 默认 all=64、realtime=2：实时节奏下只处理最新帧，
+  否则 TrackNet（~42 ms/帧）排 64 帧要 2.7 s，结果全部晚于汇合超时而作废。
+- TrackNet 实时跳帧推理时，输入仍是相机上的**连续**三帧 (t, t-1, t-2)：每帧（含不推理的帧）入队前
+  都缩放后存入 `ConsecutiveFrames`，推理时按帧号取；缺帧则该帧输出不可见。
+- TTNet 队列容量 `--ttnet-queue` 默认 8。`--pace realtime` 下队列满立即生成 `timeout / queue_full`，
+  进人工确认清单；`--review-deadline-s` 按墙钟秒判截止，迟到结果只进 `late_results.jsonl`。
 - 输出文件与 `run_cascade --out-dir` 相同，另写 `realtime_stats.json`：各阶段处理数/丢帧/帧率/耗时
   p50/p95、队列深度、TTNet queue_full/missing_context/窗口数、Ring `evicted_before_read`、
   判决端到端延迟 p50/p95/max 和总墙钟时间。

@@ -111,14 +111,28 @@ class TestOnlineFusion(unittest.TestCase):
 @unittest.skipUnless(os.path.isfile(YOLO) and os.path.isfile(TTNET) and os.path.isfile(MARKUP),
                      "缺实时回放验收数据")
 class TestReplayConsistency(unittest.TestCase):
-    def _args(self, reviewer, **kw):
+    def _args(self, reviewer, ttnet_ms="0", ttnet_queue="8"):
         argv = ["--null-camera", "3600", "--fps", "120", "--pace", "all",
                 "--yolo-replay", YOLO, "--tracknet-replay", OBS,
                 "--reviewer", reviewer, "--preset", "test2", "--quiet"]
         if reviewer == "ttnet":
             argv += ["--ttnet-cache", TTNET, "--ttnet-k", "4",
-                     "--ttnet-ms-per-window", "0"]
+                     "--ttnet-ms-per-window", ttnet_ms, "--ttnet-queue", ttnet_queue]
         return _build_parser().parse_args(argv)
+
+    def test_pace_all_backpressure_when_ttnet_is_slow(self):
+        # --pace all 不丢复核：TTNet 慢、队列只有 1 时也必须等，结果与同步回放逐条一致
+        rt = run_realtime(self._args("ttnet", ttnet_ms="2", ttnet_queue="1"))
+        self.assertEqual(rt["realtime_stats"]["ttnet"]["queue_full"], 0)
+        self.assertEqual(rt["summary"]["timeout_count"], 0)
+        tt_args = type("A", (), {"ttnet_cache": TTNET, "video": None, "ttnet_weights": None,
+                                 "ttnet_src": None, "ttnet_engine": "auto",
+                                 "ttnet_device": "cpu", "ttnet_k": 4})()
+        base = run_cascade(OBS, preset="test2", reviewer="ttnet", yolo_jsonl=YOLO,
+                           pre_ctx=4, post_ctx=4, ttnet_args=tt_args)
+        self.assertEqual(_event_rows(rt), _event_rows(base))
+        self.assertEqual(rt["summary"]["decisions"], base["summary"]["decisions"])
+        self.assertEqual(rt["summary"]["score"], {"A": 0, "B": 2})
 
     def test_rule_and_ttnet_match_run_cascade(self):
         expected_f1 = {"rule": 0.903, "ttnet": 0.871}
@@ -155,7 +169,7 @@ class TestReplayConsistency(unittest.TestCase):
 class TestRealtimeFailures(unittest.TestCase):
     def test_ttnet_queue_full_becomes_manual_timeout(self):
         a = _build_parser().parse_args([
-            "--null-camera", "500", "--fps", "120", "--pace", "all",
+            "--null-camera", "500", "--fps", "120", "--pace", "realtime",
             "--yolo-replay", YOLO, "--tracknet-replay", OBS,
             "--reviewer", "ttnet", "--ttnet-cache", TTNET,
             "--ttnet-ms-per-window", "80", "--ttnet-queue", "1",
@@ -170,7 +184,7 @@ class TestRealtimeFailures(unittest.TestCase):
             "--null-camera", "500", "--fps", "120", "--pace", "all",
             "--yolo-replay", YOLO, "--tracknet-replay", OBS,
             "--reviewer", "ttnet", "--ttnet-cache", TTNET,
-            "--ttnet-ms-per-window", "80", "--review-deadline-s", "0.01",
+            "--ttnet-ms-per-window", "20", "--review-deadline-s", "0.01",
             "--preset", "test2", "--quiet"])
         res = run_realtime(a)
         self.assertGreater(res["summary"]["timeout_count"], 0)
@@ -197,6 +211,43 @@ class TestRealtimeDrop(unittest.TestCase):
         self.assertGreater(res["realtime_stats"]["late_worker_results"], 0)
         self.assertIn("A", res["summary"]["score"])
         self.assertIn("B", res["summary"]["score"])
+
+
+class TestConsecutiveFrames(unittest.TestCase):
+    def test_window_is_camera_consecutive_even_when_inference_skips_frames(self):
+        from cascade.realtime.workers import ConsecutiveFrames
+        h = ConsecutiveFrames(lambda x: x, keep=8)
+        for f in range(10):
+            h.observe(f, f"img{f}")          # 每帧都缓存，哪怕之后不推理
+        self.assertEqual(h.window(9), ("img9", "img8", "img7"))   # (t, t-1, t-2)
+        self.assertEqual(h.window(5), ("img5", "img4", "img3"))
+        self.assertIsNone(h.window(2))       # 0、1 已被淘汰（keep=8）
+        g = ConsecutiveFrames(lambda x: x)
+        g.observe(0, "a"); g.observe(2, "c")
+        self.assertIsNone(g.window(2))       # 缺第 1 帧 → 不推理，输出不可见
+
+    def test_frame_hook_sees_dropped_frames(self):
+        from cascade.realtime.workers import TrackNetWorker
+        seen = []
+        def pred(batch):
+            return []
+        pred.observe = lambda fid, bgr: seen.append(fid)
+        w = TrackNetWorker(batch_predictor=pred, pace="realtime", queue_size=1)
+        for f in range(5):                   # 未启动线程：队列满后丢最旧帧
+            w.submit(f, f / 120, object())
+        self.assertEqual(seen, [0, 1, 2, 3, 4])
+        self.assertGreater(w.dropped, 0)
+
+
+class TestQueueDefaults(unittest.TestCase):
+    def test_realtime_uses_small_input_queues(self):
+        from cascade.run_realtime import _resolve_queue_sizes
+        a = _build_parser().parse_args(["--null-camera", "10", "--pace", "realtime"])
+        _resolve_queue_sizes(a)
+        self.assertEqual((a.yolo_queue, a.tracknet_queue), (2, 2))
+        b = _build_parser().parse_args(["--null-camera", "10", "--pace", "all"])
+        _resolve_queue_sizes(b)
+        self.assertEqual((b.yolo_queue, b.tracknet_queue), (64, 64))
 
 
 if __name__ == "__main__":
