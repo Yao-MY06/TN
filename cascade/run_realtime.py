@@ -46,8 +46,19 @@ def _clip_geometry(preset: str, quad: Optional[str]):
     return poly, calib
 
 
+def _resolve_queue_sizes(args) -> None:
+    """实时节奏下输入队列要小：TrackNet 每帧 ~42 ms，排 64 帧就要 2.7 s，
+    远超 --join-timeout-s，处理结果全部过期作废。只留最新的两帧。"""
+    default = 64 if args.pace == "all" else 2
+    if args.yolo_queue is None:
+        args.yolo_queue = default
+    if args.tracknet_queue is None:
+        args.tracknet_queue = default
+
+
 def run_realtime(args) -> Dict[str, Any]:
     started = time.monotonic()
+    _resolve_queue_sizes(args)
     poly, calib = _clip_geometry(args.preset, args.quad)
     params = ProposalParams(pre_s=args.pre_s, post_s=args.post_s,
                             bounce_min_drop=args.bounce_min_drop,
@@ -87,7 +98,8 @@ def run_realtime(args) -> Dict[str, Any]:
     tn_pred = None
     if track_replay is None and args.video and args.tracknet_weights:
         tn_pred = make_tracknet_batch_predictor(args.tracknet_weights, args.tracknet_device,
-                                                args.tracknet_min_conf)
+                                                args.tracknet_min_conf,
+                                                history_frames=args.tracknet_queue + 4 + 8)
     track_worker = TrackNetWorker(replay=track_replay, sleep_ms=args.tracknet_ms,
                                   pace=args.pace, queue_size=args.tracknet_queue,
                                   batch_predictor=tn_pred)
@@ -168,8 +180,26 @@ def run_realtime(args) -> Dict[str, Any]:
             join[fid]["tracknet"] = obs
             join[fid]["tracknet_at"] = now
 
+    def submit_ttnet(clip) -> None:
+        """--pace all：队列满就等（背压，不丢复核），等待期间照常回收已完成结果。
+        --pace realtime：队列满立即记 timeout/queue_full，进人工确认，不阻塞主线程。"""
+        nonlocal queue_full
+        while not ttnet_worker.submit(clip, dict(detections)):
+            if args.pace != "all":
+                queue_full += 1
+                core.on_timeout(clip.clip_id, last_video_t, reason="queue_full")
+                return
+            for cid, result, _wall in ttnet_worker.drain():
+                core.on_result(cid, result, last_video_t)
+                submitted_tasks.discard(cid)
+                active_deadlines.pop(cid, None)
+            time.sleep(0.001)
+        submitted_tasks.add(clip.clip_id)
+        if args.review_deadline_s:
+            active_deadlines[clip.clip_id] = time.monotonic() + args.review_deadline_s
+
     def process_fused(fused: Dict[str, Any], yolo_raw) -> None:
-        nonlocal last_video_t, queue_full
+        nonlocal last_video_t
         fid = int(fused["frame_id"])
         last_video_t = float(fused["timestamp_s"])
         if args.reviewer == "rule":
@@ -178,18 +208,11 @@ def run_realtime(args) -> Dict[str, Any]:
         for fid_, dets in detections_from_observations(evidence).items():
             detections.setdefault(fid_, []).extend(dets)
         ready = core.on_frame(fused, yolo_raw)
-        now_wall = time.monotonic()
         for clip in ready:
             if args.reviewer == "rule":
                 core.on_result(clip.clip_id, reviewer.review(clip), last_video_t)
             else:
-                if ttnet_worker.submit(clip, dict(detections)):
-                    submitted_tasks.add(clip.clip_id)
-                    if args.review_deadline_s:
-                        active_deadlines[clip.clip_id] = now_wall + args.review_deadline_s
-                else:
-                    queue_full += 1
-                    core.on_timeout(clip.clip_id, last_video_t, reason="queue_full")
+                submit_ttnet(clip)
         core.advance(last_video_t)
         record_decisions()
 
@@ -280,13 +303,7 @@ def run_realtime(args) -> Dict[str, Any]:
         if args.reviewer == "rule":
             core.on_result(clip.clip_id, reviewer.review(clip), last_video_t)
         else:
-            if ttnet_worker.submit(clip, dict(detections)):
-                submitted_tasks.add(clip.clip_id)
-                if args.review_deadline_s:
-                    active_deadlines[clip.clip_id] = time.monotonic() + args.review_deadline_s
-            else:
-                queue_full += 1
-                core.on_timeout(clip.clip_id, last_video_t, reason="queue_full")
+            submit_ttnet(clip)
     core.advance(last_video_t)
     record_decisions()
 
@@ -354,8 +371,10 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--yolo-ms", type=float, default=0.0)
     ap.add_argument("--tracknet-ms", type=float, default=0.0)
     ap.add_argument("--ttnet-ms-per-window", type=float, default=14.0)
-    ap.add_argument("--yolo-queue", type=int, default=64)
-    ap.add_argument("--tracknet-queue", type=int, default=64)
+    ap.add_argument("--yolo-queue", type=int, default=None,
+                    help="YOLO 输入队列容量；默认 all=64、realtime=2（只处理最新帧，结果才赶得上汇合）")
+    ap.add_argument("--tracknet-queue", type=int, default=None,
+                    help="TrackNet 输入队列容量；默认 all=64、realtime=2")
     ap.add_argument("--ttnet-queue", type=int, default=8)
     ap.add_argument("--join-timeout-s", type=float, default=0.5)
     ap.add_argument("--ring-s", type=float, default=3.0)

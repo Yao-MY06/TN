@@ -8,7 +8,7 @@ import queue
 import sys
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -56,6 +56,8 @@ class FrameWorker:
         self.started_wall: Optional[float] = None
         self.finished_wall: Optional[float] = None
         self._closed = False
+        # 每一帧（包括随后会被丢掉、不做推理的帧）在入队前都交给它；TrackNet 用它维护连续三帧
+        self.frame_hook: Optional[Callable[[int, Any], None]] = None
 
     def start(self) -> None:
         if self._thread is not None:
@@ -73,6 +75,8 @@ class FrameWorker:
 
     def submit(self, frame_id: int, timestamp_s: float, bgr) -> bool:
         item = (int(frame_id), float(timestamp_s), bgr)
+        if self.frame_hook is not None and bgr is not None:
+            self.frame_hook(int(frame_id), bgr)
         try:
             self.input.put_nowait(item)
         except queue.Full:
@@ -171,6 +175,7 @@ class TrackNetWorker(FrameWorker):
         self.batch_size = max(1, int(batch_size))
         self.batch_wait_s = max(0.0, float(batch_wait_ms) / 1000.0)
         super().__init__(**kwargs)
+        self.frame_hook = getattr(batch_predictor, "observe", None)
 
     def _process_batch(self, batch: List[Tuple[int, float, Any]]) -> List[Dict[str, Any]]:
         if self.batch_predictor is not None:
@@ -208,6 +213,38 @@ class TrackNetWorker(FrameWorker):
             with self._lock:
                 self.processed += len(batch)
         self.finished_wall = time.monotonic()
+
+
+class ConsecutiveFrames:
+    """按帧号保存最近若干帧（已缩放），给 TrackNet 取连续三帧 (t, t-1, t-2)。
+
+    实时节奏下 TrackNet 会跳过部分帧不推理，但它的输入必须仍是相机上的**连续**三帧，
+    与训练和离线 run_video 一致；不能拿“最近处理过的三帧”（可能是 t, t-5, t-10）。
+    每一帧都经 ``observe`` 缩放后存入（缩放很便宜），推理时按帧号取。线程安全。
+    """
+
+    def __init__(self, resize: Callable[[Any], Any], keep: int = 32) -> None:
+        self._resize = resize
+        self._keep = max(3, int(keep))
+        self._frames: "OrderedDict[int, Any]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def observe(self, frame_id: int, bgr) -> None:
+        fid = int(frame_id)
+        with self._lock:
+            if fid in self._frames:
+                return
+        small = self._resize(bgr)
+        with self._lock:
+            self._frames[fid] = small
+            while len(self._frames) > self._keep:
+                self._frames.popitem(last=False)
+
+    def window(self, frame_id: int):
+        fid = int(frame_id)
+        with self._lock:
+            got = [self._frames.get(f) for f in (fid, fid - 1, fid - 2)]
+        return None if any(g is None for g in got) else tuple(got)
 
 
 class TTNetWorker:
@@ -304,7 +341,7 @@ def make_yolo_predictor(weights: str, calib, imgsz: int = 960, conf: float = 0.1
 
 
 def make_tracknet_batch_predictor(weights: str, device: Optional[str] = None,
-                                  min_conf: float = 0.5):
+                                  min_conf: float = 0.5, history_frames: int = 32):
     """构造流式 TrackNet 批预测器；三帧顺序与 run_video 一致。"""
     import cv2
     import torch
@@ -315,18 +352,19 @@ def make_tracknet_batch_predictor(weights: str, device: Optional[str] = None,
     model = BallTrackerNet()
     model.load_state_dict(torch.load(weights, map_location=dev))
     model = model.to(dev).eval()
-    history = deque(maxlen=3)
+    # 要覆盖“入队到推理”的最大积压帧数，否则 t-1、t-2 已被淘汰
+    history = ConsecutiveFrames(lambda bgr: cv2.resize(bgr, (MODEL_W, MODEL_H)), keep=history_frames)
 
     def predict_batch(batch: List[Tuple[int, float, Any]]) -> List[Dict[str, Any]]:
         pending, outputs = [], []
         for fid, ts, frame in batch:
             h, w = frame.shape[:2]
-            small = cv2.resize(frame, (MODEL_W, MODEL_H))
-            history.append(small)
-            if len(history) < 3:
+            history.observe(fid, frame)        # 没经过 frame_hook 的调用方也能用
+            three = history.window(fid)        # (t, t-1, t-2)，与 run_video 一致；缺帧则 None
+            if three is None:
                 outputs.append(make_observation(fid, ts, "tracknet", (w, h)))
                 continue
-            stack = np.concatenate((history[2], history[1], history[0]), axis=2).astype(np.float32) / 255.0
+            stack = np.concatenate(three, axis=2).astype(np.float32) / 255.0
             pending.append((fid, ts, w, h, np.rollaxis(stack, 2, 0)))
         if pending:
             arr = np.stack([p[4] for p in pending])
@@ -348,6 +386,7 @@ def make_tracknet_batch_predictor(weights: str, device: Optional[str] = None,
                                                 center_px=(x * sx, y * sy), confidence=conf))
         outputs.sort(key=lambda o: int(o["frame_id"]))
         return outputs
+    predict_batch.observe = history.observe
     return predict_batch
 
 
