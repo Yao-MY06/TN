@@ -59,6 +59,211 @@ def _read_jsonl(path: str) -> List[Dict[str, Any]]:
         return [json.loads(line) for line in f if line.strip()]
 
 
+class CascadeCore:
+    """回放与实时共用的因果核心。
+
+    调用方只负责提供已融合的逐帧观测和复核结果；本类负责提议、片段调度、
+    水位线、提交层以及统一输出。``on_frame`` 返回的 clip 在结果返回前一直压住
+    水位线，直到 ``on_result`` 或 ``on_timeout``。
+    """
+
+    def __init__(self, poly, calib, reviewer_name: str, params: ProposalParams,
+                 commit: CommitConfig, merge: bool, max_clip_s: float,
+                 pre_ctx: int, post_ctx: int, fps: float, session_id: str = "s01",
+                 *, review_latency_s: float = 0.0, input_name: str = "",
+                 primary: str = "tracknet", fuse_stats: Optional[Dict[str, Any]] = None,
+                 reviewer_obj: Any = None) -> None:
+        self.poly = poly
+        self.calib = calib
+        self.reviewer_name = reviewer_name
+        self.params = params
+        self.commit_cfg = commit
+        self.merge = bool(merge)
+        self.max_clip_s = float(max_clip_s)
+        self.pre_ctx = int(pre_ctx)
+        self.post_ctx = int(post_ctx)
+        self.fps = float(fps)
+        self.session_id = session_id
+        self.review_latency_s = float(review_latency_s)
+        self.input_name = input_name
+        self.primary = primary
+        self.fuse_stats = fuse_stats
+        self.reviewer = reviewer_obj
+        # Oracle / TTNet 的峰值可能出现在锚点之前；规则复核固定在锚点。
+        self.max_lead_s = float(params.pre_s) if reviewer_name in ("oracle", "ttnet") else 0.0
+
+        self.index = FrameIndex()
+        self.generator = ProposalGenerator(poly, self.index, params, session_id)
+        self.scheduler = ClipScheduler(self.index, pre_ctx, post_ctx, merge=merge,
+                                       max_clip_s=max_clip_s, session_id=session_id)
+        self.referee = StreamingReferee(calib, commit)
+        self.proposals: List[Any] = []
+        self.results: List[ReviewResult] = []
+        self.late_results: List[ReviewResult] = []
+        self._awaiting: Dict[str, Any] = {}
+        self._timed_out: set[str] = set()
+        self._frames = 0
+        self._finished = False
+        self._last_now_t = 0.0
+
+    def earliest_event_t(self, clip) -> float:
+        anchor = min(p.anchor_timestamp_s for p in clip.proposals) - self.max_lead_s
+        return max(clip.start_timestamp_s, anchor)
+
+    def on_frame(self, obs: Dict[str, Any], yolo_obs: Optional[Dict[str, Any]]) -> List[Any]:
+        """喂入已融合的一帧，返回本帧已关闭、需要复核的 clip。"""
+        fid, ts = int(obs["frame_id"]), float(obs["timestamp_s"])
+        self.index.add(fid, ts)
+        self.referee.push_frame(FrameObservation.from_dict(obs))
+        b = obs["ball"]
+        txy = tuple(b["center_px"]) if b["visible"] and not b.get("predicted", False) else None
+        yxy, ygiven = None, False
+        if yolo_obs is not None:
+            ygiven = True
+            yb = yolo_obs["ball"]
+            if yb["visible"] and not yb.get("predicted", False):
+                yxy = tuple(yb["center_px"])
+        new = self.generator.update(fid, ts, txy, yxy, ygiven)
+        self.proposals.extend(new)
+        self.scheduler.add(new)
+        ready = self.scheduler.poll(self.generator.min_future_anchor_t() - self.params.pre_s)
+        for clip in ready:
+            self._awaiting[clip.clip_id] = clip
+        self._frames += 1
+        self._last_now_t = ts
+        return ready
+
+    def flush(self) -> List[Any]:
+        """流结束后冲刷前瞻窗口，返回最后一批 clip。"""
+        tail = self.generator.flush()
+        self.proposals.extend(tail)
+        self.scheduler.add(tail)
+        ready = self.scheduler.poll(float("inf"), final=True)
+        for clip in ready:
+            self._awaiting[clip.clip_id] = clip
+        return ready
+
+    def on_result(self, clip_id: str, result: ReviewResult, now_t: float) -> None:
+        """正常或迟到结果到达。迟到结果不提交，只进诊断输出。"""
+        self._last_now_t = float(now_t)
+        if clip_id in self._timed_out:
+            result.completed_frame_id = self.index.last_frame_id
+            self.late_results.append(result)
+            return
+        if clip_id not in self._awaiting:
+            raise KeyError(f"未知或重复的复核结果: {clip_id}")
+        self._awaiting.pop(clip_id)
+        result.completed_frame_id = self.index.last_frame_id
+        self.results.append(result)
+        self.referee.add_bounces(result.events)
+
+    def on_timeout(self, clip_id: str, now_t: float, reason: str = "deadline_exceeded") -> None:
+        """复核截止/队列满：合成 timeout，并释放该片段对水位线的阻塞。"""
+        self._last_now_t = float(now_t)
+        if clip_id in self._timed_out:
+            return
+        clip = self._awaiting.pop(clip_id, None)
+        if clip is None:
+            raise KeyError(f"未知或已完成的复核片段: {clip_id}")
+        self._timed_out.add(clip_id)
+        self.results.append(ReviewResult(
+            clip.clip_id, clip.proposal_ids, "timeout", [], reason,
+            per_proposal={pid: f"timeout:{reason}" for pid in clip.proposal_ids},
+            reviewer=self.reviewer_name, submitted_frame_id=clip.submitted_frame_id,
+            completed_frame_id=self.index.last_frame_id, n_windows=clip.n_windows))
+
+    def bounce_unknown_before(self) -> float:
+        w = self.generator.min_future_anchor_t() - self.max_lead_s
+        for clip in self.scheduler.open_clips():
+            w = min(w, self.earliest_event_t(clip))
+        for clip in self._awaiting.values():
+            w = min(w, self.earliest_event_t(clip))
+        return w
+
+    def advance(self, now_t: float) -> None:
+        self._last_now_t = float(now_t)
+        self.referee.advance(self.bounce_unknown_before())
+
+    def finish(self) -> Dict[str, Any]:
+        if self._finished:
+            raise RuntimeError("CascadeCore.finish() called twice")
+        self.referee.finish()
+        self._finished = True
+        t0 = self.index.first_timestamp or 0.0
+        t1 = self.index.last_timestamp or 0.0
+        rel_lag = [real - evt for _, evt, real in self.referee.release_lag]
+        dec_lag = [r["real_t"] - r["virtual_t"] for r in self.referee.decision_records]
+        reasons = Counter(r for p in self.proposals for r in p.reasons)
+        review_queue = build_review_queue({
+            "results": self.results, "clips": self.scheduler.submitted,
+            "reviewer": self.reviewer, "referee": self.referee,
+        })
+        timeout_count = sum(r.status == "timeout" for r in self.results)
+        manual_count = sum(q["category"] == "manual" for q in review_queue)
+        summary = {
+            "input": self.input_name, "preset": getattr(self, "preset", ""),
+            "reviewer": self.reviewer_name,
+            "frames": self._frames, "duration_s": round(t1 - t0, 3),
+            "score": {"A": self.referee.score[0], "B": self.referee.score[1]},
+            "decisions": self.referee.decisions,
+            "event_counts": dict(self.referee.counts),
+            "source_stats": dict(self.referee.source.stats) if self.referee.source else {},
+            "proposals": {"total": len(self.proposals), "by_reason": dict(reasons),
+                          "generator_stats": self.generator.stats},
+            "clips": {"total": len(self.scheduler.submitted), **self.scheduler.stats,
+                      "coverage": round(self.scheduler.coverage(t0, t1), 4),
+                      "ttnet_windows": self.scheduler.total_windows(),
+                      "ttnet_window_ratio": round(self.scheduler.total_windows()
+                                                  / max(1, self._frames), 4)},
+            "reviews": dict(Counter(r.status for r in self.results)),
+            "timeout_count": timeout_count,
+            "timeout_ratio": round(timeout_count / max(1, len(self.scheduler.submitted)), 4),
+            "late_result_count": len(self.late_results),
+            "manual_confirm_count": manual_count,
+            "manual_confirm_ratio": round(manual_count / max(1, len(self.scheduler.submitted)), 4),
+            "unreviewable_count": sum(q["category"] == "unreviewable" for q in review_queue),
+            "missing_context_ratio": round(self.scheduler.stats["missing_context"]
+                                           / max(1, len(self.scheduler.submitted)), 4),
+            "bounces": {"confirmed": sum(len(r.events) for r in self.results),
+                        "kept_after_jitter": len(self.referee.kept_bounces),
+                        "jitter_dropped": [round(e.timestamp_s, 3)
+                                           for e in self.referee.jitter_dropped]},
+            "out_events": [{"t": round(e.timestamp_s, 3), "side": e.side}
+                           for e in self.referee.out_events],
+            "latency_s": {
+                "event_release_p50": _pct(rel_lag, 0.5), "event_release_p95": _pct(rel_lag, 0.95),
+                "event_release_max": max(rel_lag) if rel_lag else None,
+                "decision_p50": _pct(dec_lag, 0.5), "decision_p95": _pct(dec_lag, 0.95),
+                "review_latency_s": self.review_latency_s,
+            },
+            "n_lowconf_masked": self.referee.n_lowconf,
+            "serve_guard_suppressed": [round(ev.timestamp_s, 3)
+                                       for ev, _ in (self.referee.source.suppressed_serve
+                                                     if self.referee.source else [])],
+            "params": asdict(self.params), "commit": asdict(self.commit_cfg),
+            "merge": self.merge, "max_clip_s": self.max_clip_s,
+            "pre_ctx": self.pre_ctx, "post_ctx": self.post_ctx,
+            "primary": self.primary,
+        }
+        if self.fuse_stats is not None:
+            summary["fusion"] = self.fuse_stats
+        if self.reviewer_name == "ttnet" and self.reviewer is not None:
+            ms = sorted(self.reviewer.scores.infer_ms)
+            summary["ttnet"] = {
+                "backend": self.reviewer.scores.kind, "k": self.reviewer.k,
+                "windows_dedup": self.reviewer.n_windows,
+                "windows_dedup_ratio": round(self.reviewer.n_windows / max(1, self._frames), 4),
+                "infer_ms_p50": _pct(ms, 0.5), "infer_ms_p95": _pct(ms, 0.95),
+            }
+        if self.reviewer_name == "oracle" and self.reviewer is not None:
+            summary["oracle_missed"] = [round(e["timestamp_s"], 3)
+                                         for e in self.reviewer.missed()]
+        return {"summary": summary, "proposals": self.proposals,
+                "clips": self.scheduler.submitted, "results": self.results,
+                "late_results": self.late_results, "review_queue": review_queue,
+                "referee": self.referee, "reviewer": self.reviewer}
+
+
 def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
         reviewer: str = "rule", oracle_events: Optional[str] = None,
         yolo_jsonl: Optional[str] = None,
@@ -116,87 +321,52 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
         rev = build_ttnet_reviewer(ttnet_args, poly, evidence, fps=fps, pre_s=params.pre_s)
     else:
         raise SystemExit(f"未知复核器: {reviewer}（TTNet 复核器在第 5 步接入）")
-    ref = StreamingReferee(calib, commit)
+    core = CascadeCore(
+        poly, calib, reviewer, params, commit, merge, max_clip_s, pre_ctx, post_ctx,
+        fps, session_id, review_latency_s=review_latency_s,
+        input_name=os.path.basename(jsonl), primary=primary,
+        fuse_stats=fuse_stats, reviewer_obj=rev)
+    core.preset = preset
 
-    proposals, results, late_results = [], [], []
     # 每项：模拟完成时刻、截止时刻（视频时间）、clip 和已经算出的结果。
-    # review() 在当前实现中是同步的；due_t 模拟结果到达提交层的时间。
     inflight: List[Dict[str, Any]] = []
 
-    def earliest_event_t(c) -> float:
-        a = min(p.anchor_timestamp_s for p in c.proposals) - rev.max_lead_s
-        return max(c.start_timestamp_s, a)
-
     def deliver(now_t: float, force: bool = False) -> None:
-        """交付到期结果；超时项合成 timeout，原结果稍后只写 late_results。"""
+        """交付到期结果；超时项由 core 合成 timeout，原结果稍后记为迟到。"""
         still: List[Dict[str, Any]] = []
         for item in inflight:
             c = item["clip"]
             if item["timed_out"]:
-                # 迟到的真实结果绝不送状态机，只留作诊断。
                 if force or item["due_t"] <= now_t + _EPS_T:
-                    r = item["result"]
-                    r.completed_frame_id = index.last_frame_id
-                    late_results.append(r)
+                    core.on_result(c.clip_id, item["result"], now_t)
                 else:
                     still.append(item)
                 continue
 
             deadline_t = item["deadline_t"]
             due = item["due_t"] <= now_t + _EPS_T
-            # 流结束（force）时也按截止时间判：预计完成晚于截止的，照样记 timeout，
-            # 不能因为视频到头了就把本该超时的结果当正常结果提交。
             late_at_end = (force and not due and deadline_t is not None
                            and item["due_t"] > deadline_t + _EPS_T)
             if (force or due) and not late_at_end:
-                r = item["result"]
-                r.completed_frame_id = index.last_frame_id
-                results.append(r)
-                ref.add_bounces(r.events)
+                core.on_result(c.clip_id, item["result"], now_t)
                 continue
 
             if deadline_t is not None and (deadline_t <= now_t + _EPS_T or late_at_end):
-                timeout = ReviewResult(
-                    c.clip_id, c.proposal_ids, "timeout", [], "deadline_exceeded",
-                    per_proposal={pid: "timeout:deadline_exceeded" for pid in c.proposal_ids},
-                    reviewer=rev.name, submitted_frame_id=c.submitted_frame_id,
-                    completed_frame_id=index.last_frame_id, n_windows=c.n_windows)
-                results.append(timeout)
+                core.on_timeout(c.clip_id, now_t)
                 item["timed_out"] = True
                 if force:
-                    item["result"].completed_frame_id = index.last_frame_id
-                    late_results.append(item["result"])
+                    core.on_result(c.clip_id, item["result"], now_t)
                 else:
                     still.append(item)
             else:
                 still.append(item)
         inflight[:] = still
 
-    def bounce_unknown_before() -> float:
-        w = gen.min_future_anchor_t() - rev.max_lead_s
-        for c in sched.open_clips():
-            w = min(w, earliest_event_t(c))
-        for item in inflight:
-            if not item["timed_out"]:
-                w = min(w, earliest_event_t(item["clip"]))
-        return w
-
-    for pos, d in enumerate(raw):
-        fid, ts = int(d["frame_id"]), float(d["timestamp_s"])
-        index.add(fid, ts)
-        ref.push_frame(FrameObservation.from_dict(d))
-        b = d["ball"]
-        txy = tuple(b["center_px"]) if b["visible"] and not b.get("predicted", False) else None
-        yxy, ygiven = None, False
-        if yolo is not None:
-            yd = yolo.get(fid)
-            ygiven = yd is not None
-            if yd is not None and yd["ball"]["visible"]:
-                yxy = tuple(yd["ball"]["center_px"])
-        new = gen.update(fid, ts, txy, yxy, ygiven)
-        proposals.extend(new)
-        sched.add(new)
-        for c in sched.poll(gen.min_future_anchor_t() - params.pre_s):
+    for d in raw:
+        ts = float(d["timestamp_s"])
+        fid = int(d["frame_id"])
+        ready = core.on_frame(d, yolo.get(fid) if yolo is not None else None)
+        for c in ready:
             inflight.append({
                 "clip": c,
                 "result": rev.review(c),
@@ -205,13 +375,10 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
                 "timed_out": False,
             })
         deliver(ts)
-        ref.advance(bounce_unknown_before())
+        core.advance(ts)
 
-    tail = gen.flush()
-    proposals.extend(tail)
-    sched.add(tail)
-    end_t = (index.last_timestamp + 1.0 / fps) if raw else 0.0   # 流结束 = 最后一帧之后
-    for c in sched.poll(float("inf"), final=True):
+    end_t = (core.index.last_timestamp + 1.0 / fps) if raw else 0.0
+    for c in core.flush():
         inflight.append({
             "clip": c,
             "result": rev.review(c),
@@ -220,72 +387,7 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
             "timed_out": False,
         })
     deliver(end_t, force=True)
-    ref.finish()
-
-    # ---------------------------------------------------------------- 汇总
-    t0, t1 = index.first_timestamp or 0.0, index.last_timestamp or 0.0
-    rel_lag = [real - evt for _, evt, real in ref.release_lag]
-    dec_lag = [r["real_t"] - r["virtual_t"] for r in ref.decision_records]
-    reasons = Counter(r for p in proposals for r in p.reasons)
-    review_queue = build_review_queue({
-        "results": results, "clips": sched.submitted, "reviewer": rev, "referee": ref,
-    })
-    summary = {
-        "input": os.path.basename(jsonl), "preset": preset, "reviewer": rev.name,
-        "frames": len(raw), "duration_s": round(t1 - t0, 3),
-        "score": {"A": ref.score[0], "B": ref.score[1]},
-        "decisions": ref.decisions,
-        "event_counts": dict(ref.counts),
-        "source_stats": dict(ref.source.stats) if ref.source else {},
-        "proposals": {"total": len(proposals), "by_reason": dict(reasons),
-                      "generator_stats": gen.stats},
-        "clips": {"total": len(sched.submitted), **sched.stats,
-                  "coverage": round(sched.coverage(t0, t1), 4),
-                  "ttnet_windows": sched.total_windows(),
-                  "ttnet_window_ratio": round(sched.total_windows() / max(1, len(raw)), 4)},
-        "reviews": dict(Counter(r.status for r in results)),
-        "timeout_count": sum(r.status == "timeout" for r in results),
-        "timeout_ratio": round(sum(r.status == "timeout" for r in results)
-                               / max(1, len(sched.submitted)), 4),
-        "late_result_count": len(late_results),
-        # 规则复核判断不了的片段（no_reviewable_candidate）不算“需要人工确认”，单独计数
-        "manual_confirm_count": sum(q["category"] == "manual" for q in review_queue),
-        "manual_confirm_ratio": round(sum(q["category"] == "manual" for q in review_queue)
-                                      / max(1, len(sched.submitted)), 4),
-        "unreviewable_count": sum(q["category"] == "unreviewable" for q in review_queue),
-        "missing_context_ratio": round(sched.stats["missing_context"]
-                                       / max(1, len(sched.submitted)), 4),
-        "bounces": {"confirmed": sum(len(r.events) for r in results),
-                    "kept_after_jitter": len(ref.kept_bounces),
-                    "jitter_dropped": [round(e.timestamp_s, 3) for e in ref.jitter_dropped]},
-        "out_events": [{"t": round(e.timestamp_s, 3), "side": e.side} for e in ref.out_events],
-        "latency_s": {
-            "event_release_p50": _pct(rel_lag, 0.5), "event_release_p95": _pct(rel_lag, 0.95),
-            "event_release_max": max(rel_lag) if rel_lag else None,
-            "decision_p50": _pct(dec_lag, 0.5), "decision_p95": _pct(dec_lag, 0.95),
-            "review_latency_s": review_latency_s,
-        },
-        "n_lowconf_masked": ref.n_lowconf,
-        "serve_guard_suppressed": [round(ev.timestamp_s, 3) for ev, _ in (ref.source.suppressed_serve if ref.source else [])],
-        "params": asdict(params), "commit": asdict(commit),
-        "merge": merge, "max_clip_s": max_clip_s, "pre_ctx": pre_ctx, "post_ctx": post_ctx,
-    }
-    summary["primary"] = primary
-    if fuse_stats is not None:
-        summary["fusion"] = fuse_stats
-    if rev.name == "ttnet":
-        ms = sorted(rev.scores.infer_ms)
-        summary["ttnet"] = {
-            "backend": rev.scores.kind, "k": rev.k,
-            "windows_dedup": rev.n_windows,
-            "windows_dedup_ratio": round(rev.n_windows / max(1, len(raw)), 4),
-            "infer_ms_p50": _pct(ms, 0.5), "infer_ms_p95": _pct(ms, 0.95),
-        }
-    if isinstance(rev, OracleReviewer):
-        summary["oracle_missed"] = [round(e["timestamp_s"], 3) for e in rev.missed()]
-    return {"summary": summary, "proposals": proposals, "clips": sched.submitted,
-            "results": results, "late_results": late_results, "review_queue": review_queue,
-            "referee": ref, "reviewer": rev}
+    return core.finish()
 
 
 def write_outputs(out_dir: str, res: Dict[str, Any]) -> None:
