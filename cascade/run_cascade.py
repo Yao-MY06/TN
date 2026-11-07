@@ -97,6 +97,7 @@ class CascadeCore:
         self.scheduler = ClipScheduler(self.index, pre_ctx, post_ctx, merge=merge,
                                        max_clip_s=max_clip_s, session_id=session_id)
         self.referee = StreamingReferee(calib, commit)
+        self.referee.event_callback = self._on_referee_event if params.net_trigger else None
         self.proposals: List[Any] = []
         self.results: List[ReviewResult] = []
         self.late_results: List[ReviewResult] = []
@@ -105,6 +106,24 @@ class CascadeCore:
         self._frames = 0
         self._finished = False
         self._last_now_t = 0.0
+
+    def _on_referee_event(self, ev) -> None:
+        """核心 NET_TOUCH → net_anomaly 提议（只在开关开启时）。"""
+        if not self.params.net_trigger or ev.type != "NET_TOUCH":
+            return
+        prop = self.generator.add_net_anomaly(float(ev.timestamp_s))
+        if prop is not None:
+            self.proposals.append(prop)
+            self.scheduler.add([prop])
+
+    def _poll_ready(self, final: bool = False) -> List[Any]:
+        if final:
+            ready = self.scheduler.poll(float("inf"), final=True)
+        else:
+            ready = self.scheduler.poll(self.generator.min_future_anchor_t() - self.params.pre_s)
+        for clip in ready:
+            self._awaiting[clip.clip_id] = clip
+        return ready
 
     def earliest_event_t(self, clip) -> float:
         anchor = min(p.anchor_timestamp_s for p in clip.proposals) - self.max_lead_s
@@ -126,9 +145,7 @@ class CascadeCore:
         new = self.generator.update(fid, ts, txy, yxy, ygiven)
         self.proposals.extend(new)
         self.scheduler.add(new)
-        ready = self.scheduler.poll(self.generator.min_future_anchor_t() - self.params.pre_s)
-        for clip in ready:
-            self._awaiting[clip.clip_id] = clip
+        ready = self._poll_ready()
         self._frames += 1
         self._last_now_t = ts
         return ready
@@ -138,10 +155,7 @@ class CascadeCore:
         tail = self.generator.flush()
         self.proposals.extend(tail)
         self.scheduler.add(tail)
-        ready = self.scheduler.poll(float("inf"), final=True)
-        for clip in ready:
-            self._awaiting[clip.clip_id] = clip
-        return ready
+        return self._poll_ready(final=True)
 
     def on_result(self, clip_id: str, result: ReviewResult, now_t: float) -> None:
         """正常或迟到结果到达。迟到结果不提交，只进诊断输出。"""
@@ -178,11 +192,13 @@ class CascadeCore:
             w = min(w, self.earliest_event_t(clip))
         for clip in self._awaiting.values():
             w = min(w, self.earliest_event_t(clip))
+        w = min(w, self.referee.held_hit_watermark())
         return w
 
-    def advance(self, now_t: float) -> None:
+    def advance(self, now_t: float) -> List[Any]:
         self._last_now_t = float(now_t)
         self.referee.advance(self.bounce_unknown_before())
+        return self._poll_ready()
 
     def finish(self) -> Dict[str, Any]:
         if self._finished:
@@ -198,8 +214,27 @@ class CascadeCore:
             "results": self.results, "clips": self.scheduler.submitted,
             "reviewer": self.reviewer, "referee": self.referee,
         })
+        for adj in self.referee.net_adjudications:
+            if adj["decision"] == "reverse":
+                category, reason = "net_reversal", "net_reversal"
+            elif adj["decision"] == "uncertain":
+                category, reason = "manual", "net_hit_uncertain"
+            else:
+                continue
+            t = float(adj["timestamp_s"])
+            near = [dict(d) for d in self.referee.decision_records
+                    if t - 1.0 <= float(d.get("virtual_t", 0.0)) <= t + 1.0]
+            review_queue.append({
+                "clip_id": f"net_hold:{adj['event_id']}", "category": category,
+                "proposal_ids": [], "status": "uncertain", "reason": reason,
+                "reason_codes": [reason], "start_timestamp_s": round(t - 0.1, 6),
+                "end_timestamp_s": round(t + 0.3, 6),
+                "start_frame_id": None, "end_frame_id": None, "missing_context": False,
+                "hump_peak": None, "humps": [], "nearby_decisions": near,
+                "reviewer": "net_hold", "net_decision": adj,
+            })
         timeout_count = sum(r.status == "timeout" for r in self.results)
-        manual_count = sum(q["category"] == "manual" for q in review_queue)
+        manual_count = sum(q["category"] in ("manual", "net_reversal") for q in review_queue)
         summary = {
             "input": self.input_name, "preset": getattr(self, "preset", ""),
             "reviewer": self.reviewer_name,
@@ -244,6 +279,17 @@ class CascadeCore:
             "merge": self.merge, "max_clip_s": self.max_clip_s,
             "pre_ctx": self.pre_ctx, "post_ctx": self.post_ctx,
             "primary": self.primary,
+            "net_hit_hold": {
+                "enabled": bool(self.commit_cfg.net_hit_hold),
+                "held": len(self.referee.net_adjudications),
+                "released": sum(a["decision"] == "released"
+                                for a in self.referee.net_adjudications),
+                "reversed": sum(a["decision"] == "reverse"
+                                for a in self.referee.net_adjudications),
+                "uncertain": sum(a["decision"] == "uncertain"
+                                 for a in self.referee.net_adjudications),
+                "events": list(self.referee.net_adjudications),
+            },
         }
         if self.fuse_stats is not None:
             summary["fusion"] = self.fuse_stats
@@ -273,12 +319,17 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
         pre_ctx: int = 0, post_ctx: int = 0, session_id: str = "s01",
         fps: float = 120.0, ttnet_args: Any = None,
         primary: str = "tracknet", fuse_params: Optional[FuseParams] = None,
-        yolo_recapture: bool = True) -> Dict[str, Any]:
+        yolo_recapture: bool = True, net_hit_hold: bool = False,
+        net_trigger: bool = False) -> Dict[str, Any]:
     # 方案 §4.1：超时一律按时间戳，不按固定帧数（各模型帧率、延迟不同）。
     if review_latency_s < 0 or review_deadline_s < 0:
         raise ValueError("review latency/deadline must be >= 0 s")
     params = params or ProposalParams()
     commit = commit or CommitConfig()
+    if net_hit_hold or net_trigger:
+        params = replace(params, net_trigger=True)
+    if net_hit_hold:
+        commit = replace(commit, net_hit_hold=True)
     db = load_detect_bounce()
     quad_key = quad or PRESET_TO_QUAD.get(preset, preset)
     poly = db.load_quad(quad_key)
@@ -331,6 +382,16 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
     # 每项：模拟完成时刻、截止时刻（视频时间）、clip 和已经算出的结果。
     inflight: List[Dict[str, Any]] = []
 
+    def schedule_reviews(ready, now_t: float) -> None:
+        for c in ready:
+            inflight.append({
+                "clip": c,
+                "result": rev.review(c),
+                "due_t": now_t + review_latency_s,
+                "deadline_t": now_t + review_deadline_s if review_deadline_s else None,
+                "timed_out": False,
+            })
+
     def deliver(now_t: float, force: bool = False) -> None:
         """交付到期结果；超时项由 core 合成 timeout，原结果稍后记为迟到。"""
         still: List[Dict[str, Any]] = []
@@ -366,26 +427,12 @@ def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
         ts = float(d["timestamp_s"])
         fid = int(d["frame_id"])
         ready = core.on_frame(d, yolo.get(fid) if yolo is not None else None)
-        for c in ready:
-            inflight.append({
-                "clip": c,
-                "result": rev.review(c),
-                "due_t": ts + review_latency_s,
-                "deadline_t": ts + review_deadline_s if review_deadline_s else None,
-                "timed_out": False,
-            })
+        schedule_reviews(ready, ts)
         deliver(ts)
-        core.advance(ts)
+        schedule_reviews(core.advance(ts), ts)
 
     end_t = (core.index.last_timestamp + 1.0 / fps) if raw else 0.0
-    for c in core.flush():
-        inflight.append({
-            "clip": c,
-            "result": rev.review(c),
-            "due_t": end_t + review_latency_s,
-            "deadline_t": end_t + review_deadline_s if review_deadline_s else None,
-            "timed_out": False,
-        })
+    schedule_reviews(core.flush(), end_t)
     deliver(end_t, force=True)
     return core.finish()
 
@@ -461,6 +508,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "yolo=试验（YOLO 主跟踪，TrackNet 只补 YOLO 丢球的帧）")
     ap.add_argument("--no-yolo-recapture", action="store_true",
                     help="primary=tracknet 时不用 YOLO 补 TrackNet 丢球的帧（只做分歧触发）")
+    ap.add_argument("--net-hit-hold", action="store_true",
+                    help="用核心 NET_TOUCH 触发网附近提议，并扣住网带内击球做 0.3s 裁决")
     ap.add_argument("--yolo-min-conf", type=float, default=0.5)
     ap.add_argument("--fill-window-s", type=float, default=0.5,
                     help="primary=yolo：最近多久见过球才调用 TrackNet 补位（秒）；-1=YOLO 一丢就调")
@@ -509,6 +558,7 @@ def main(argv: Optional[List[str]] = None) -> int:
               pre_ctx=a.pre_ctx, post_ctx=a.post_ctx,
               ttnet_args=a if a.reviewer == "ttnet" else None,
               primary=a.primary, yolo_recapture=not a.no_yolo_recapture,
+              net_hit_hold=a.net_hit_hold,
               fuse_params=FuseParams(yolo_min_conf=a.yolo_min_conf,
                                      fill_window_s=None if a.fill_window_s < 0 else a.fill_window_s))
     if not a.quiet:

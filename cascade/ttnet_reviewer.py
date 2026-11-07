@@ -312,10 +312,19 @@ class TTNetReviewer:
         from observation import make_event
         self.n_reviews += 1
         a, b = int(clip.start_frame_id), int(clip.end_frame_id)
+        entry = {'clip_id': clip.clip_id, 'start_frame_id': a, 'end_frame_id': b, 'k': self.k}
+        # net_anomaly 是交给网带击球轨迹裁决的专用区间；若没有与其他触发器合并，
+        # 不让通用 bounce 复核把它误当成新的落台。
+        if clip.proposals and all(p.reasons == ['net_anomaly'] for p in clip.proposals):
+            reason = 'net_anomaly_deferred_to_trajectory'
+            entry.update(status='rejected', reasons=[reason], humps=[], net_cross=[],
+                         max_bounce=None, n_new_windows=0)
+            self.log.append(entry)
+            per = {pid: 'rejected:net_anomaly_deferred' for pid in clip.proposal_ids}
+            return self._result(clip, 'rejected', [], reason, per, 0)
         used_before = len(self.scores.used)
         got, missing = (None, []) if clip.missing_context else self.frame_scores(a, b)
         n_new = len(self.scores.used) - used_before
-        entry = {'clip_id': clip.clip_id, 'start_frame_id': a, 'end_frame_id': b, 'k': self.k}
         if got is None:
             reason = 'missing_context'
             entry.update(status='error', missing_windows=missing[:20], n_missing=len(missing))
