@@ -108,9 +108,9 @@ class FrameWorker:
             obs = self.predictor(bgr, int(fid), float(ts))
         else:
             obs = self._missing(item)
-        self.process_s.append(time.perf_counter() - t0)
         if self.sleep_s:
             time.sleep(self.sleep_s)
+        self.process_s.append(time.perf_counter() - t0)
         return obs
 
     def _run(self) -> None:
@@ -176,9 +176,9 @@ class TrackNetWorker(FrameWorker):
         if self.batch_predictor is not None:
             t0 = time.perf_counter()
             obs = self.batch_predictor(batch)
-            self.process_s.append(time.perf_counter() - t0)
             if self.sleep_s:
                 time.sleep(self.sleep_s)
+            self.process_s.append(time.perf_counter() - t0)
             return obs
         out = [self._process(item) for item in batch]
         return out
