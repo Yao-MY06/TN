@@ -133,6 +133,7 @@ def run_realtime(args) -> Dict[str, Any]:
     active_deadlines: Dict[str, float] = {}
     queue_full = 0
     join_timeouts = 0
+    late_worker_results = 0
     decision_lags: List[float] = []
     seen_decisions = 0
     last_video_t = 0.0
@@ -148,15 +149,22 @@ def run_realtime(args) -> Dict[str, Any]:
         seen_decisions = len(recs)
 
     def drain_workers() -> None:
+        nonlocal late_worker_results
         now = time.monotonic()
         if yolo_worker is not None:
             for obs in yolo_worker.drain():
                 fid = int(obs["frame_id"])
+                if fid not in join:
+                    late_worker_results += 1
+                    continue
                 join[fid]["yolo"] = obs
                 join[fid]["yolo_at"] = now
                 yolo_raw_by_fid[fid] = obs
         for obs in track_worker.drain():
             fid = int(obs["frame_id"])
+            if fid not in join:
+                late_worker_results += 1
+                continue
             join[fid]["tracknet"] = obs
             join[fid]["tracknet_at"] = now
 
@@ -312,6 +320,7 @@ def run_realtime(args) -> Dict[str, Any]:
             "ttnet_depth_max": ttnet_worker.queue_depth_max if ttnet_worker else 0,
         },
         "join_timeouts": join_timeouts,
+        "late_worker_results": late_worker_results,
         "ttnet": {
             "queue_full": queue_full,
             "missing_context": sum(1 for r in res["results"] if r.reason == "missing_context"),
