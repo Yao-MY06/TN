@@ -360,7 +360,7 @@ def _write_summary(out_dir: str, rows: List[Dict[str, Any]], total: Optional[Dic
               "（test_1 / test_4 / test_7 各有一段），空档内的检出不计入，条数见“空档检出”列。",
               "人工确认比例不含复核器无法判断的片段（规则复核遇到只有丢球触发的片段，"
               "原因码 no_reviewable_candidate），其条数见 summary.csv 的 *_unreviewable_count。", ""]
-    with open(os.path.join(out_dir, "summary.md"), "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "summary.md"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines))
 
 
