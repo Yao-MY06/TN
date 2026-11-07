@@ -3,7 +3,9 @@
 标注来源：https://github.com/moamal01/table_tennis_data （CC BY-NC-SA 4.0，arXiv:2512.19327）
 ``data/raw/game_data/test/test_N.json``：键为帧号，值为击球（如 ``right_forehand_loop …``）
 或回合结束（如 ``left_out``）。**前缀是造成这一分结束的一方，即丢分方**；A = 左，B = 右。
-它不含落台——落台真值仍要原版 OpenTTGames 的 ``events_markup.json``（见 eval_proposals.py）。
+test_1、test_3～7 的文件里还混有原版 OpenTTGames 的事件标签（``bounce`` / ``net`` / ``empty_event``，
+不带左右前缀），解析时跳过，不算击球——否则“下一次击球”会提前到下一次落台，
+回合结束后稍晚的正确判罚会被算成“未判分 + 多判”。落台真值仍用 ``events_markup.json``。
 
     python -m cascade.eval_extended --run-dir outputs/cascade/test_2_rule \\
         --game-json _data/gt/extended_openttgames/game_data/test/test_2.json
@@ -28,6 +30,7 @@ if __package__ in (None, ""):
 from cascade.eval_proposals import _read_jsonl, match  # noqa: E402
 
 ENDINGS = ("net", "not_hitting_ball", "winner", "double_bounce", "out", "miss_on_own_side")
+EVENT_LABELS = ("bounce", "net", "empty_event")   # 混入的原版事件标签，不是击球
 
 
 def parse_game_json(path: str):
@@ -36,6 +39,8 @@ def parse_game_json(path: str):
     strokes, endings = [], []
     for fr in sorted(raw):
         head = raw[fr].split()[0]
+        if head in EVENT_LABELS:
+            continue
         side_word, _, rest = head.partition("_")
         side = "A" if side_word == "left" else "B" if side_word == "right" else None
         if rest in ENDINGS:
