@@ -68,7 +68,7 @@ python -m cascade.run_realtime --video <test_2.mp4> --pace realtime \
 ```
 
 - `--pace all` 由有界队列形成背压，**不丢帧、不丢复核**：TTNet 队列满时主线程等待（同时回收已完成结果），
-  结果与 `run_cascade` 同步回放逐条一致。`--pace realtime` 按视频 fps / speed 吐帧，worker 队列满时
+  结果与 `run_cascade` 同步回放逐条一致；汇合也不设超时，模型再慢也等两路结果到齐（`--join-timeout-s` 只在 realtime 下生效）。`--pace realtime` 按视频 fps / speed 吐帧，worker 队列满时
   丢最旧帧并输出不可见观测，迟到结果若晚于 `--join-timeout-s` 会被忽略并计数。
 - 输入队列 `--yolo-queue` / `--tracknet-queue` 默认 all=64、realtime=2：实时节奏下只处理最新帧，
   否则 TrackNet（~42 ms/帧）排 64 帧要 2.7 s，结果全部晚于汇合超时而作废。

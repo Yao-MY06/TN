@@ -252,3 +252,24 @@ class TestQueueDefaults(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(os.path.isfile(YOLO), "缺 test_2 YOLO 观测")
+class TestPaceAllNoJoinTimeout(unittest.TestCase):
+    """--pace all 不丢帧：模型比汇合超时还慢时也必须等结果，不能把排队中的观测当超时作废。"""
+
+    def _args(self, tracknet_ms):
+        return _build_parser().parse_args([
+            "--null-camera", "400", "--fps", "120", "--pace", "all",
+            "--yolo-replay", YOLO, "--tracknet-replay", OBS,
+            "--yolo-ms", "0", "--tracknet-ms", tracknet_ms,
+            "--join-timeout-s", "0.01", "--reviewer", "rule",
+            "--preset", "test2", "--quiet"])
+
+    def test_slow_models_still_join_every_frame(self):
+        fast = run_realtime(self._args("0"))
+        slow = run_realtime(self._args("3"))
+        self.assertEqual(slow["realtime_stats"]["join_timeouts"], 0)
+        self.assertEqual(slow["realtime_stats"]["late_worker_results"], 0)
+        self.assertEqual(slow["fused_trace"], fast["fused_trace"])
+        self.assertEqual(_event_rows(slow), _event_rows(fast))

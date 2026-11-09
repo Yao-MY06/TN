@@ -226,12 +226,14 @@ def run_realtime(args) -> Dict[str, Any]:
             fid = row["frame_id"]
             ent = join[fid]
             timed_out = False
-            if not force and yolo_worker is not None and ent["yolo"] is None:
+            # --pace all 不丢帧：靠有界队列背压，必须等到两路结果都到，不按汇合超时作废
+            use_timeout = not force and args.pace != "all"
+            if use_timeout and yolo_worker is not None and ent["yolo"] is None:
                 if now - row["capture_wall"] < args.join_timeout_s:
                     break
                 ent["yolo"] = _invisible(fid, row["timestamp_s"], (1920, 1080), "yolo")
                 timed_out = True
-            if not force and ent["tracknet"] is None:
+            if use_timeout and ent["tracknet"] is None:
                 if now - row["capture_wall"] < args.join_timeout_s:
                     break
                 ent["tracknet"] = _invisible(fid, row["timestamp_s"], (1920, 1080), "tracknet")
