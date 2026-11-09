@@ -33,7 +33,7 @@ python -m unittest discover -s cascade/tests -t .
 
 `--out-dir` 下会写出 `proposals.jsonl`、`clips.jsonl`、`reviews.jsonl`、`late_results.jsonl`、
 `review_queue.jsonl`、`events.jsonl`（格式同 `run_mixed.py --events-out`）、`decisions.jsonl`、
-`log.txt`、`summary.json`；TTNet 组另有 `ttnet_reviews.jsonl`。
+`log.txt`、`summary.json`、`fused_obs.jsonl`（逐帧融合后球位，只给画视频用）；TTNet 组另有 `ttnet_reviews.jsonl`。
 
 ## 实时层（简化版）
 
@@ -84,6 +84,20 @@ python -m cascade.run_realtime --video <test_2.mp4> --pace realtime \
 test_2 全回放（sleep=0）与 `run_cascade` 的 proposals / clips / `events.jsonl`、判罚文本和比分逐项一致；
 规则复核落台 F1 0.903，TTNet 复核 0.871。
 
+## 画视频（事后渲染）
+
+`render_video.py` 把任一 `run_cascade` / `run_realtime` 输出目录画成带 HUD 的 mp4：球位与尾迹（TrackNet 橙、YOLO 青）、
+当前提议区间及其 TTNet 复核状态、确认的事件和最近落点、比分与判罚、底部全片时间轴。渲染在运行结束后单独做，不影响实时计时。
+
+```bash
+python -m cascade.render_video --run-dir outputs/realtime/a_all --video <test_2.mp4> \
+    --preset test2 --max-frames 3600 --out outputs/realtime/a_all/cascade_hud.mp4
+```
+
+球位优先用运行目录里的 `fused_obs.jsonl`。旧版运行没有这个文件时，可加 `--tracknet-obs`（可再加 `--yolo-obs`）离线融合出球位，
+画面会标 `ball: offline obs (not this run)`，实时节奏下的丢帧不会反映在球位上。`--scale 0.5` 可输出 960×540。
+区间颜色是该区间最终的复核结果（事后才知道），不代表复核在区间开始时就已完成。
+
 ## 网附近异常：NET_TOUCH 触发 + 网带击球扣留（默认关闭）
 
 `--net-hit-hold` 同时开启两个默认关闭的能力：
@@ -127,6 +141,7 @@ python -m cascade.run_cascade --jsonl _data/obs/tracknet/test_4.jsonl \
 | `eval_ttnet_outside.py` | §7：全片 TTNet 驼峰中，峰值不落在任何复核片段内、且与真值落台 ±5 帧匹配的漏检 |
 | `review_queue.py` | 汇总 `uncertain` / `error` / `timeout` 片段，生成待人工确认清单 |
 | `run_batch.py` | 按清单批量跑 rule / ttnet，生成 `summary.md` / `summary.csv` 与 holdout 池化合计 |
+| `render_video.py` | 事后把一次运行画成带 HUD 的视频（球位来源、复核区间状态、事件、比分、时间轴） |
 | `run_realtime.py` | 实时层入口：视频/空帧源、并行 YOLO/TrackNet/TTNet worker、有界队列与运行统计 |
 | `realtime/frames.py` | `Camera` / `VideoFileCamera` / `NullCamera` 与线程安全 320×128 帧环形缓存 |
 | `realtime/workers.py` | YOLO/TrackNet 逐帧 worker、TTNet 区间 worker；均支持无 GPU 的回放 sleep 模式 |

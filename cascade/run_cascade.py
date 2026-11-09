@@ -106,6 +106,8 @@ class CascadeCore:
         self._frames = 0
         self._finished = False
         self._last_now_t = 0.0
+        # 逐帧融合后球位（给 render_video 画视频用，不参与判罚）
+        self.fused_trace: List[Dict[str, Any]] = []
 
     def _on_referee_event(self, ev) -> None:
         """核心 NET_TOUCH → net_anomaly 提议（只在开关开启时）。"""
@@ -133,6 +135,12 @@ class CascadeCore:
         """喂入已融合的一帧，返回本帧已关闭、需要复核的 clip。"""
         fid, ts = int(obs["frame_id"]), float(obs["timestamp_s"])
         self.index.add(fid, ts)
+        bb = obs["ball"]
+        self.fused_trace.append({
+            "frame_id": fid, "timestamp_s": ts, "source": obs.get("source"),
+            "visible": bool(bb.get("visible")), "center_px": bb.get("center_px"),
+            "predicted": bool(bb.get("predicted", False)), "confidence": bb.get("confidence"),
+        })
         self.referee.push_frame(FrameObservation.from_dict(obs))
         b = obs["ball"]
         txy = tuple(b["center_px"]) if b["visible"] and not b.get("predicted", False) else None
@@ -307,7 +315,8 @@ class CascadeCore:
         return {"summary": summary, "proposals": self.proposals,
                 "clips": self.scheduler.submitted, "results": self.results,
                 "late_results": self.late_results, "review_queue": review_queue,
-                "referee": self.referee, "reviewer": self.reviewer}
+                "referee": self.referee, "reviewer": self.reviewer,
+                "fused_trace": self.fused_trace}
 
 
 def run(jsonl: str, preset: str = "test2", quad: Optional[str] = None,
@@ -454,6 +463,8 @@ def write_outputs(out_dir: str, res: Dict[str, Any]) -> None:
     dump("events.jsonl", [{**e, "sources": ref.event_sources.get(e["event_id"], [])}
                           for e in ref.dumped_events])
     dump("decisions.jsonl", res["referee"].decision_records)
+    if res.get("fused_trace") is not None:
+        dump("fused_obs.jsonl", res["fused_trace"])
     if getattr(res.get("reviewer"), "name", "") == "ttnet":
         dump("ttnet_reviews.jsonl", res["reviewer"].log)
     with open(os.path.join(out_dir, "log.txt"), "w", encoding="utf-8") as f:
