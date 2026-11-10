@@ -134,6 +134,22 @@ class TestReplayConsistency(unittest.TestCase):
         self.assertEqual(rt["summary"]["decisions"], base["summary"]["decisions"])
         self.assertEqual(rt["summary"]["score"], {"A": 0, "B": 2})
 
+    def test_scoreboard_option_matches_summary_points(self):
+        a = self._args("rule")
+        a.scoreboard = True
+        a.voice = "none"
+        a.ui = False
+        a.say = False
+        a.dead_ball_mode = "ignore"
+        a.pending_timeout_s = 5.0
+        with tempfile.TemporaryDirectory() as tmp:
+            a.out_dir = tmp
+            rt = run_realtime(a)
+            self.assertEqual(rt["summary"]["score"], {"A": 0, "B": 2})
+            self.assertEqual(rt["scoreboard"]["physical_points"], {"A": 0, "B": 2})
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "scoreboard_log.jsonl")))
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "scoreboard_final.json")))
+
     def test_rule_and_ttnet_match_run_cascade(self):
         expected_f1 = {"rule": 0.903, "ttnet": 0.871}
         for reviewer in ("rule", "ttnet"):
@@ -250,6 +266,22 @@ class TestQueueDefaults(unittest.TestCase):
         self.assertEqual((b.yolo_queue, b.tracknet_queue), (64, 64))
 
 
+class TestRealtimeScoreboardParser(unittest.TestCase):
+    def test_scoreboard_flags_are_parsed(self):
+        a = _build_parser().parse_args([
+            "--null-camera", "1", "--tracknet-replay", OBS,
+            "--scoreboard", "--ui", "--ui-port", "0", "--ui-window", "800x480",
+            "--open-browser", "--voice", "text", "--no-say",
+            "--dead-ball-mode", "ignore", "--pending-timeout-s", "2.5"])
+        self.assertTrue(a.scoreboard)
+        self.assertTrue(a.ui)
+        self.assertEqual(a.ui_port, 0)
+        self.assertEqual(a.ui_window, "800x480")
+        self.assertTrue(a.open_browser)
+        self.assertEqual(a.voice, "text")
+        self.assertFalse(a.say)
+        self.assertEqual(a.dead_ball_mode, "ignore")
+        self.assertEqual(a.pending_timeout_s, 2.5)
 if __name__ == "__main__":
     unittest.main()
 

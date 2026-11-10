@@ -27,7 +27,7 @@ python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl
 python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl \
     --preset test2 --review-latency-s 0.75 --review-deadline-s 0.5
 
-# 回归测试（105 项；没有 TTNet 权重时，需要权重的测试自动跳过）
+# 回归测试（116 项；没有 TTNet 权重时，需要权重的测试自动跳过；语音文本依赖缺失时对应测试跳过）
 python -m unittest discover -s cascade/tests -t .
 ```
 
@@ -83,6 +83,115 @@ python -m cascade.run_realtime --video <test_2.mp4> --pace realtime \
 
 test_2 全回放（sleep=0）与 `run_cascade` 的 proposals / clips / `events.jsonl`、判罚文本和比分逐项一致；
 规则复核落台 F1 0.903，TTNet 复核 0.871。
+
+## 计分 UI 与语音
+
+三模型级联只负责产生 `decisions.jsonl`。级联状态机照常独立运行，不回写；语音仓库的 `ScoreEngine`
+是视觉、语音和 UI 唯一共同读写的记分牌。
+
+```text
+run_cascade / run_realtime decisions
+              │
+              ▼
+       ScoreboardBridge
+       ├─ 物理 A/B → 选手 A/B（按 engine.side_of_a）
+       ├─ POINT / DEAD_BALL / LET
+       ├─ 待确认超时
+       └─ scoreboard_log.jsonl
+              │
+              ▼
+       SharedScoreBoard.engine (ScoreEngine)
+       ├─ ScoreServer GET /api/state → 浏览器计分 UI
+       └─ tt_voice Pipeline.push_text / feed → 同一 engine
+```
+
+### 判罚映射
+
+| 级联 kind | 动作 | 播报 |
+|---|---|---|
+| `POINT` | 物理侧先按 `side_of_a` 换成选手；有视觉待确认项先 `reject_pending()`，再 `finish_rally(..., reason="vision:<rule>", confidence=1.0, source="vision")` | “左方得分，左方3比2右方” |
+| `DEAD_BALL` | 默认 `propose_pending("UNKNOWN", reason="vision:<rule>", source="vision")`；`--dead-ball-mode ignore` 时只记日志 | “这一分请确认” |
+| `LET` | `let(reason="vision:<rule>", source="vision")` | 不额外播报 |
+| 其他 | 只写桥接日志 | 无 |
+
+- `engine.side_of_a == "left"` 时，物理 A→选手 A、B→B；每局结束换边后，物理 A→选手 B、B→A。
+- 视觉和语音写入在同一个主循环里串行执行；启用 UI 时，写操作和 UI 读取共用 `ScoreServer._server.lock`。
+- 待确认超时按视频秒数计算：`--pending-timeout-s` 默认 5 s。
+- `--say` 默认开启，`--no-say` 关闭。播报文本只含比分/提示，不含唤醒词。
+
+### 回放入口
+
+`run_scoreboard.py` 的主要开关：`--ui` / `--ui-port` / `--ui-window` / `--open-browser`，
+`--voice none|text|mic`，`--say` / `--no-say`，`--dead-ball-mode pending|ignore`，
+`--pending-timeout-s`（秒），`--speed`，`--max-frames`。`run_realtime.py` 需先加 `--scoreboard`，
+再使用同一组 UI/语音开关。
+
+```powershell
+cd E:\20-项目\ppq\TN
+$env:PYTHONUTF8='1'
+python -m cascade.run_scoreboard `
+  --run-dir E:\20-项目\ppq\TN\outputs\cascade_batch_sm\tn\test_2_rule `
+  --video D:\OpenTTGames\test\videos\test_2.mp4 `
+  --speed 1 --max-frames 3600 `
+  --ui --open-browser --ui-port 8765 --ui-window 1024x600 `
+  --voice none --say `
+  --out-dir E:\20-项目\ppq\TN\outputs\scoreboard_replay\test_2_ui
+```
+
+预期：播放 test_2 视频时打开 `http://127.0.0.1:8765/`，先显示 0:0，两个 POINT 依次到 0:2；
+每次视觉加分听到“右方得分，左方0比1/2右方”。结束时终端打印物理累计 `A:0 B:2`，
+并写 `scoreboard_log.jsonl`、`scoreboard_final.json`。
+
+文本模式（stdin 与视觉在同一个主循环处理，唤醒词可以和口令同句）：
+
+```powershell
+python -m cascade.run_scoreboard `
+  --run-dir E:\20-项目\ppq\TN\outputs\cascade_batch_sm\tn\test_2_rule `
+  --video D:\OpenTTGames\test\videos\test_2.mp4 `
+  --speed 1 --max-frames 3600 `
+  --ui --open-browser --ui-port 8765 --ui-window 1024x600 `
+  --voice text --say `
+  --out-dir E:\20-项目\ppq\TN\outputs\scoreboard_replay\test_2_text
+```
+
+预期：视觉到 0:2 后，在终端输入 `小裁判 撤销上一分`，UI 回到 0:1 并播报“已撤销”；
+再输入 `小裁判 左方加一分`，UI 变为 1:1。文本模式会跳过单独的唤醒阶段，但口令里带“ 小裁判 ”也能匹配。
+
+麦克风模式（先确认设备编号；没有默认输入设备时用 `python -m tt_voice.cli devices`）：
+
+```powershell
+python -m cascade.run_scoreboard `
+  --run-dir E:\20-项目\ppq\TN\outputs\cascade_batch_sm\tn\test_2_rule `
+  --video D:\OpenTTGames\test\videos\test_2.mp4 `
+  --speed 1 --max-frames 3600 `
+  --ui --open-browser --ui-port 8765 --ui-window 1024x600 `
+  --voice mic --input-device 0 --say `
+  --out-dir E:\20-项目\ppq\TN\outputs\scoreboard_replay\test_2_mic
+```
+
+预期：先说“小裁判”，听到“在”；再说“撤销上一分”或“左方加一分”，UI 与播报同步更新。
+如果 `0` 不是你的麦克风编号，替换成 `devices` 输出中的编号。
+
+`run_realtime.py` 同样支持这些开关，只需加 `--scoreboard`：
+
+```powershell
+python -m cascade.run_realtime --video D:\OpenTTGames\test\videos\test_2.mp4 `
+  --pace realtime --reviewer rule --tracknet-replay E:\20-项目\ppq\TN\adapter\examples\test_2_observations.jsonl `
+  --preset test2 --scoreboard --ui --open-browser --say --voice none `
+  --out-dir E:\20-项目\ppq\TN\outputs\scoreboard_replay\realtime_test_2
+```
+
+### 已知限制
+
+- 语音/UI 的人工撤销、补分、重置只作用于 `ScoreEngine`，不会回写级联状态机。桥接层会把这类动作记为
+  `manual_override`，但之后的视觉判罚仍按级联自己的状态继续，因此人工改分后两边可能不一致。
+- `ScoreEngine` 是 11 分、五局三胜、两次发球换发；级联状态机只负责产生事件和判分建议。回放验收比较的是
+  `physical_points`（视觉 POINT 按当时的物理侧累计），UI 当前局分是 `snapshot.points` / `snapshot.sets`，长局结束后当前局分会归零。
+- UI 是只读计分牌，只有语音/视觉主循环能写；语音仓库与 UI 仓库包名相同，cascade 只按路径挂载
+  `pingpong-voice-referee`，不会同时加载另一份 `tt_referee`。
+- `DEAD_BALL` 的待确认侧别是 `UNKNOWN`。只说“确认这一分”不会猜赢家，而是保留待确认并提示补说“左方加一分/右方加一分”；直接说方向会补上该分。
+- Windows 播报走 SAPI；Linux 只输出控制台文本。麦克风需要 `sounddevice`，语音文本需要 `pypinyin` 等语音仓库依赖。
+- 本机无 `pypinyin`，所以 `push_text` 测试自动跳过；回放、UI、桥接和计分测试不依赖该包。
 
 ## 画视频（事后渲染）
 
@@ -143,7 +252,9 @@ python -m cascade.run_cascade --jsonl _data/obs/tracknet/test_4.jsonl \
 | `run_batch.py` | 按清单批量跑 rule / ttnet，生成 `summary.md` / `summary.csv` 与 holdout 池化合计；支持 `--state-machine` |
 | `compare_sm.py` | 只读批量输出，比较多个状态机的判分、门因归因、门控计数与出界诊断 |
 | `render_video.py` | 事后把一次运行画成带 HUD 的视频（球位来源、复核区间状态、事件、比分、时间轴） |
-| `run_realtime.py` | 实时层入口：视频/空帧源、并行 YOLO/TrackNet/TTNet worker、有界队列与运行统计 |
+| `run_realtime.py` | 实时层入口：视频/空帧源、并行 YOLO/TrackNet/TTNet worker、有界队列与运行统计；可接计分牌 |
+| `scoreboard_bridge.py` | 级联判罚 → 语音仓库 `ScoreEngine` 的映射、待确认超时与日志 |
+| `run_scoreboard.py` | 回放判罚驱动计分 UI/语音，并写 `scoreboard_log.jsonl` / `scoreboard_final.json` |
 | `realtime/frames.py` | `Camera` / `VideoFileCamera` / `NullCamera` 与线程安全 320×128 帧环形缓存 |
 | `realtime/workers.py` | YOLO/TrackNet 逐帧 worker、TTNet 区间 worker；均支持无 GPU 的回放 sleep 模式 |
 | `state_machines.py` | 计分状态机选择：`tn`（默认）、`gd` / `gd-traj` / `gd-nr` 或 TTNet1.1 的两个档位 |

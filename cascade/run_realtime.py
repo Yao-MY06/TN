@@ -24,6 +24,8 @@ from cascade.realtime.workers import (TTNetWorker, TrackNetWorker, YoloWorker,
                                       make_tracknet_batch_predictor, make_yolo_predictor)
 from cascade.reviewers import RuleReviewer
 from cascade.run_cascade import CascadeCore, _pct, write_outputs
+from cascade.run_scoreboard import ScoreboardRuntime
+from cascade.scoreboard_bridge import ScoreboardBridge
 from cascade.state_machines import CHOICES
 from cascade.ttnet_reviewer import DEFAULT_K, detections_from_observations
 from core.geometry import CALIBRATION_PRESETS
@@ -152,6 +154,18 @@ def run_realtime(args) -> Dict[str, Any]:
     last_video_t = 0.0
     last_progress = started
 
+    scoreboard_runtime = None
+    if args.scoreboard:
+        bridge = ScoreboardBridge(
+            say=args.say, dead_ball_mode=args.dead_ball_mode,
+            pending_timeout_s=args.pending_timeout_s)
+        scoreboard_runtime = ScoreboardRuntime(
+            bridge, voice=args.voice, ui=args.ui, ui_port=args.ui_port,
+            ui_window=args.ui_window, open_browser=args.open_browser,
+            input_device=args.input_device, quiet=args.quiet)
+    elif args.ui or args.voice != "none":
+        raise SystemExit("--ui / --voice 需要同时打开 --scoreboard")
+
     def record_decisions() -> None:
         nonlocal seen_decisions
         recs = core.referee.decision_records
@@ -159,6 +173,8 @@ def run_realtime(args) -> Dict[str, Any]:
             cap = next((r["capture_wall"] for r in order_rows if r["frame_id"] == row["frame_id"]), None)
             if cap is not None:
                 decision_lags.append(time.monotonic() - cap)
+            if scoreboard_runtime is not None:
+                scoreboard_runtime.apply_decision(row, float(row.get("virtual_t", last_video_t)))
         seen_decisions = len(recs)
 
     def drain_workers() -> None:
@@ -273,6 +289,9 @@ def run_realtime(args) -> Dict[str, Any]:
             if args.max_frames is not None and fid >= args.max_frames:
                 break
             wall = time.monotonic()
+            if scoreboard_runtime is not None:
+                scoreboard_runtime.tick(float(ts))
+                scoreboard_runtime.poll(wall)
             order_rows.append({"frame_id": int(fid), "timestamp_s": float(ts),
                                "capture_wall": wall})
             join[int(fid)] = {"yolo": None, "tracknet": None,
@@ -321,7 +340,18 @@ def run_realtime(args) -> Dict[str, Any]:
         handle_clips(core.advance(last_video_t))
         record_decisions()
 
+    if scoreboard_runtime is not None:
+        scoreboard_runtime.tick(last_video_t + args.pending_timeout_s)
+        scoreboard_payload = scoreboard_runtime.bridge.final_payload()
+        scoreboard_runtime.close()
+    else:
+        scoreboard_payload = None
     res = core.finish()
+    if scoreboard_payload is not None:
+        res["scoreboard"] = scoreboard_payload
+        if args.out_dir:
+            scoreboard_runtime_paths = scoreboard_runtime.bridge.write_outputs(args.out_dir) if scoreboard_runtime else {}
+            res["scoreboard"]["paths"] = scoreboard_runtime_paths
     wall_s = time.monotonic() - started
     realtime_stats = {
         "camera": {"kind": "video" if args.video else "null", "pace": args.pace,
@@ -407,6 +437,16 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-jitter-merge", action="store_true")
     ap.add_argument("--no-out", action="store_true")
     ap.add_argument("--state-machine", choices=CHOICES, default="tn")
+    ap.add_argument("--scoreboard", action="store_true", help="把每条判罚送进语音仓库的 ScoreEngine")
+    ap.add_argument("--ui", action="store_true")
+    ap.add_argument("--ui-port", type=int, default=8765)
+    ap.add_argument("--ui-window", default="1024x600")
+    ap.add_argument("--open-browser", action="store_true")
+    ap.add_argument("--voice", choices=["none", "text", "mic"], default="none")
+    ap.add_argument("--say", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--dead-ball-mode", choices=["pending", "ignore"], default="pending")
+    ap.add_argument("--pending-timeout-s", type=float, default=5.0)
+    ap.add_argument("--input-device", type=int, default=None)
     ap.add_argument("--yolo-imgsz", type=int, default=960)
     ap.add_argument("--yolo-conf", type=float, default=0.18)
     ap.add_argument("--yolo-device", default=None)
@@ -422,10 +462,16 @@ def main(argv=None) -> int:
     a = _build_parser().parse_args(argv)
     if a.join_timeout_s < 0 or a.review_deadline_s < 0:
         raise SystemExit("join/deadline 秒数必须 >= 0")
+    if a.pending_timeout_s < 0:
+        raise SystemExit("pending-timeout-s 必须 >= 0")
+    if not a.scoreboard and (a.ui or a.voice != "none"):
+        raise SystemExit("--ui / --voice 需要同时打开 --scoreboard")
     res = run_realtime(a)
     if not a.quiet:
         print(json.dumps(res["realtime_stats"], ensure_ascii=False, indent=2))
         print("score", res["summary"]["score"], "decisions", res["summary"]["decisions"])
+        if res.get("scoreboard"):
+            print("scoreboard", res["scoreboard"]["physical_points"], res["scoreboard"]["snapshot"]["points"], res["scoreboard"]["snapshot"]["sets"])
     if a.out_dir:
         write_outputs(a.out_dir, res)
         with open(os.path.join(a.out_dir, "realtime_stats.json"), "w", encoding="utf-8") as f:
