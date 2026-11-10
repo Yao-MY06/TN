@@ -5,6 +5,7 @@
   ``core/schemas.py`` 不变（加载时校验），因此事件类型、判罚对象与 TN 是同一套类。
   ``gd`` 只换状态机；``gd-traj`` 连同新版 ``TrajectoryEventProcessor``（关联速度硬截断、确认帧防劫持）一起换。
   按文件路径加载、以独立模块名注册，``from core.xxx`` 解析到 TN 的 core；不复制、不修改国栋仓库。
+  ``gd-nr`` 仅用于归因分析（把 ``enable_no_return`` 打开到 TN 默认值），不是采用候选。
 
 * ``tn``（默认）：TN 仓库 ``tt/_unpacked/core`` 的共用状态机，与 run_mixed 完全一致。
 * ``ttnet11-yolo`` / ``ttnet11-ttnet``：chagoup/TTNet1.1 的 ``TTNetStateMachine``，
@@ -22,6 +23,7 @@ import importlib.util
 import os
 import sys
 import types
+from dataclasses import replace
 from typing import Dict, Optional
 
 from ._paths import PPQ_ROOT, YOLO_ROOT  # noqa: F401  确保 core 可导入
@@ -29,7 +31,7 @@ from ._paths import PPQ_ROOT, YOLO_ROOT  # noqa: F401  确保 core 可导入
 import core.schemas as _schemas  # noqa: E402
 import core.state_machine as _sm  # noqa: E402
 
-CHOICES = ("tn", "ttnet11-yolo", "ttnet11-ttnet", "gd", "gd-traj")
+CHOICES = ("tn", "ttnet11-yolo", "ttnet11-ttnet", "gd", "gd-traj", "gd-nr")
 try:
     from ._paths import TTNET11_ROOT
 except ImportError:
@@ -113,7 +115,11 @@ def make_state_machine(kind: str = "tn"):
         mod = _load_ttnet11()
         profile = mod.Profile.YOLO if kind.endswith("yolo") else mod.Profile.TTNET
         return mod.TTNetStateMachine(profile=profile)
-    if kind in ("gd", "gd-traj"):
+    if kind in ("gd", "gd-traj", "gd-nr"):
         mod = _load_gd("state_machine.py")
-        return mod.TableTennisStateMachine(mod.MatchRules())
+        rules = mod.MatchRules()
+        if kind == "gd-nr":
+            # 仅用于归因分析，不是采用候选；只把 NO_RETURN 打开。
+            rules = replace(rules, enable_no_return=True)
+        return mod.TableTennisStateMachine(rules)
     raise ValueError(f"未知状态机 {kind!r}，可选 {CHOICES}")

@@ -27,7 +27,7 @@ python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl
 python -m cascade.run_cascade --jsonl adapter/examples/test_2_observations.jsonl \
     --preset test2 --review-latency-s 0.75 --review-deadline-s 0.5
 
-# 回归测试（102 项；没有 TTNet 权重时，需要权重的测试自动跳过）
+# 回归测试（105 项；没有 TTNet 权重时，需要权重的测试自动跳过）
 python -m unittest discover -s cascade/tests -t .
 ```
 
@@ -141,12 +141,12 @@ python -m cascade.run_cascade --jsonl _data/obs/tracknet/test_4.jsonl \
 | `eval_ttnet_outside.py` | §7：全片 TTNet 驼峰中，峰值不落在任何复核片段内、且与真值落台 ±5 帧匹配的漏检 |
 | `review_queue.py` | 汇总 `uncertain` / `error` / `timeout` 片段，生成待人工确认清单 |
 | `run_batch.py` | 按清单批量跑 rule / ttnet，生成 `summary.md` / `summary.csv` 与 holdout 池化合计；支持 `--state-machine` |
-| `compare_sm.py` | 只读批量输出，比较多个状态机的判分、门控计数与出界诊断 |
+| `compare_sm.py` | 只读批量输出，比较多个状态机的判分、门因归因、门控计数与出界诊断 |
 | `render_video.py` | 事后把一次运行画成带 HUD 的视频（球位来源、复核区间状态、事件、比分、时间轴） |
 | `run_realtime.py` | 实时层入口：视频/空帧源、并行 YOLO/TrackNet/TTNet worker、有界队列与运行统计 |
 | `realtime/frames.py` | `Camera` / `VideoFileCamera` / `NullCamera` 与线程安全 320×128 帧环形缓存 |
 | `realtime/workers.py` | YOLO/TrackNet 逐帧 worker、TTNet 区间 worker；均支持无 GPU 的回放 sleep 模式 |
-| `state_machines.py` | 计分状态机选择：`tn`（默认）、`gd` / `gd-traj` 或 TTNet1.1 的两个档位 |
+| `state_machines.py` | 计分状态机选择：`tn`（默认）、`gd` / `gd-traj` / `gd-nr` 或 TTNet1.1 的两个档位 |
 | `ttnet_engine.py` | TTNet 单窗推理：`TorchEngine`（用 TTNet 仓库的 create_model，在外层兼容 CPU）/ `NumpyEngine`（不依赖 torch 的复刻，自带 .pth 读取） |
 | `ttnet_cache.py` | 视频 → 逐窗口 TTNet 分数 JSONL（原机用） |
 | `ttnet_reviewer.py` | `TTNetReviewer`：replay / live 两个后端，驼峰检测 + 印证判定 |
@@ -235,14 +235,18 @@ chagoup/TTNet1.1（放在 `ppq/TTNet1.1`）移植了同一套共用状态机，�
 
 - `gd`：只换 `core/state_machine.py`。发球准入、发球前 1.5 s 内须有击球、回合内须有击球才判分（OUT 同样受限）、判分后冷却 2 s、`NO_RETURN` 默认关、按 `event_id` 去重。
 - `gd-traj`：在 `gd` 基础上再换 `core/trajectory_processor.py`（关联速度上限 9000 px/s、确认帧防劫持）。
+- `gd-nr`：国栋状态机，仅把 `MatchRules.enable_no_return` 打开到 TN 默认值；只用于归因分析，不是采用候选。
 - 加载前会核对国栋与 TN 的 `core/schemas.py`（忽略 CRLF 差异）；不一致直接报错，不会混用事件类型。
-- 两个仓库都只读引用，不复制文件。`summary.json` 的 `state_machine` 记录实际档位，`sm_gates` 记录门控计数（`tn` 为 `null`）。
+- 两个仓库都只读引用，不复制文件。`summary.json` 的 `state_machine` 记录实际档位，`sm_gates` 记录门控计数（`tn` 为 `null`），`state_machine_event_id_renames` 记录送入状态机前的 ID 改名次数。
+
+cascade 层会把送给状态机的事件 ID 在单次运行内改成唯一值：首项保持原名，重复项稳定加 `~2`、`~3` 后缀。`events.jsonl`、`decisions.jsonl` 和 `event_sources` 仍使用原 ID，因此 tn 的对外输出不变。这个处理修掉了核心轨迹层与 `OnlineOutDetector` 都生成 `out_00001` 起的 ID 时的撞号；国栋状态机不会再误把真实 OUT 当成重复事件。
 
 | `--state-machine` | test_2 规则复核 | test_2 TTNet 复核 |
 |---|---|---|
 | `tn`（默认） | 0:2，2/2 分正确 | 0:2，2/2 |
 | `gd` | 0:1，1/2；`left_net` 被发球准入挡下 | 0:1，1/2 |
 | `gd-traj` | 与 `gd` 逐条相同 | 与 `gd` 逐条相同 |
+| `gd-nr` | 0:1，1/2；同一分仍被发球准入挡下 | 0:1，1/2 |
 | `ttnet11-yolo` | 与 `tn` 逐条相同（有单测） | 同左 |
 | `ttnet11-ttnet` | **0:6**，多判 4 个 `DOUBLE_BOUNCE` | **3:3**，多判 5 分、漏判 1 分 |
 
@@ -250,27 +254,28 @@ chagoup/TTNet1.1（放在 `ppq/TTNet1.1`）移植了同一套共用状态机，�
 于是 2.508 s、3.383 s 两次 A 侧落台被当成连跳两次。这个档位是按 TTNet 自己的事件流调的，放进级联会多判分，
 所以默认仍用 `tn`，`ttnet11-*` 只作对照。
 
-### 7 段视频上的 tn / gd / gd-traj 对比
+### 7 段视频上的 tn / gd / gd-traj / gd-nr 对比
 
 同一份 `cascade/batch_manifest.json`，每个状态机各跑 rule 与 TTNet 两组：
 
 ```bash
-for sm in tn gd gd-traj; do
+for sm in tn gd gd-traj gd-nr; do
   python -m cascade.run_batch --manifest cascade/batch_manifest.json \
       --out-dir outputs/cascade_batch_sm/$sm --state-machine $sm
 done
 python -m cascade.compare_sm \
     --base outputs/cascade_batch_sm/tn \
-    --compare outputs/cascade_batch_sm/gd outputs/cascade_batch_sm/gd-traj \
+    --compare outputs/cascade_batch_sm/gd outputs/cascade_batch_sm/gd-traj outputs/cascade_batch_sm/gd-nr \
     --out outputs/cascade_batch_sm
 ```
 
-`compare.md` 分四段：
+`compare.md` 分五段：
 
 1. **合计表**：每个状态机 × 每种复核，test_2 单列，留出集合计；列出判对、出界/下网/其他未判、判错方、多判、死球。
 2. **逐分改判表**：相对 tn，只列“原来对→现在错”和“原来错→现在对”，并给出双方的判罚。
-3. **门控计数**：gd / gd-traj 每道门挡掉的事件数，按视频和复核器列出。
-4. **出界诊断**：每个未判 `*_out` 的分，在“上一个真值分结束 → 本题 `gt_t + 2 s`”窗口内有没有 OUT 事件、判罚是什么。
+3. **门因归因表**：对“原来对→现在错”的每一分，用已保存的 `events.jsonl`、`fused_obs.jsonl`、`decisions.jsonl` 回放状态机定位门因。
+4. **门控计数**：每个状态机每道门挡掉的事件数，按视频和复核器列出。
+5. **出界诊断**：每个未判 `*_out` 的分，在“上一个真值分结束 → 本题 `gt_t + 2 s`”窗口内有没有 OUT 事件、判罚是什么。
 
 留出集结果（从 `outputs/cascade_batch_sm/compare.md` 抄录）：
 
@@ -278,14 +283,25 @@ python -m cascade.compare_sm \
 |---|---|---:|---:|---:|---:|---:|---:|
 | `tn` | rule | 34/56 | 8 | 3 | 8 | 28 | 35 |
 | `tn` | ttnet | 34/56 | 11 | 2 | 7 | 19 | 32 |
-| `gd` | rule | 11/56 | 23 | 13 | 3 | 2 | 69 |
-| `gd` | ttnet | 9/56 | 24 | 14 | 3 | 1 | 72 |
-| `gd-traj` | rule | 11/56 | 23 | 13 | 3 | 2 | 69 |
-| `gd-traj` | ttnet | 9/56 | 24 | 14 | 3 | 1 | 72 |
+| `gd` | rule | 14/56 | 21 | 13 | 3 | 2 | 65 |
+| `gd` | ttnet | 13/56 | 21 | 14 | 3 | 1 | 67 |
+| `gd-traj` | rule | 14/56 | 21 | 13 | 3 | 2 | 65 |
+| `gd-traj` | ttnet | 13/56 | 21 | 14 | 3 | 1 | 67 |
+| `gd-nr` | rule | 21/56 | 19 | 9 | 4 | 5 | 54 |
+| `gd-nr` | ttnet | 19/56 | 18 | 11 | 6 | 4 | 54 |
 
-结论：门控版没有减少出界漏判，rule 从 8 增到 23、TTNet 从 11 增到 24；它显著压低多判和判错，但死球大幅增加，整体判对从 34/56 降到 11/56（rule）和 9/56（TTNet）。没有“原来错→现在对”的分；留出集有 23 条（rule）和 25 条（TTNet）原来判对的分变成未判，逐事件核对的主要门因是 `NO_RETURN` 默认关闭、`event_id` 重复被去重、发球准入未完成、`serve_phase_ignored`，以及少量 `splice_skips` / `no_hit_skips`。`gd-traj` 与 `gd` 在这批输出上逐项相同，轨迹层的两项修正在这 7 段上没有改变最终判分。
+结论：
 
-`tn` 回归：`outputs/cascade_batch_sm/tn/summary.md` 与上周 `outputs/cascade_batch/summary.md` 除标题行（新增状态机名）外逐字节相同。
+- 修掉 OUT ID 撞号后，`gd` 比上一轮多判对 3 分（rule 11→14）和 4 分（TTNet 9→13）；`gd-traj` 仍与 `gd` 逐项相同。
+- `gd-nr` 相比 `gd` 再多判对 7 分（rule 14→21）和 6 分（TTNet 13→19），说明 `NO_RETURN` 默认关闭是上一轮最主要的人为差距之一。
+- 但 `gd-nr` 仍比 tn 少判对 13 分（rule）和 15 分（TTNet）。留出集剩余“原本判对→现在未判”为 rule 16 条、TTNet 17 条；按门因分别为：
+  - rule：发球准入未完成 5、发球阶段判罚被忽略 5、回合内须有击球 3、同侧两弹夹击球 1、判分后冷却 1、未进入可判分回合 1。
+  - ttnet：发球阶段判罚被忽略 7、发球准入未完成 5、未进入可判分回合 2、回合内须有击球 2、同侧两弹夹击球 1。
+- 修复后门因表不再出现事件 ID 撞号；所有新跑法中 `duplicate_event_ids_ignored` 都是 0。`gd-traj` 与 `gd` 的门因也完全一致。
+- 出界漏判仍高于 tn：`gd` 为 rule 21 / TTNet 21，`gd-nr` 为 rule 19 / TTNet 18；多判虽从 tn 的 28/19 降到 5/4（gd-nr），死球仍明显增加到 54/54。
+- 送入状态机的 ID 改名次数（rule/TTNet）：`gd`、`gd-traj`、`tn` 相同，依次为 test_1 0/0、test_2 0/0、test_3 1/1、test_4 4/5、test_5 1/1、test_6 2/2、test_7 1/1；`gd-nr` 除 test_4 为 5/6 外其余相同。
+
+`tn` 回归：`outputs/cascade_batch_sm/tn_verify/summary.md` 与旧 `outputs/cascade_batch_sm/tn/summary.md` 逐字节相同；14 组 `events.jsonl` 和 14 组 `decisions.jsonl` 也全部逐字节相同。
 
 ## 下一步
 

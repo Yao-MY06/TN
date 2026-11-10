@@ -14,7 +14,8 @@
       "preset": "test2",                         # 可选
       "fps": 120.0,
       "review_deadline_s": 0,                    # 可选，秒（旧键 *_frames 按 fps 换算）
-      "review_latency_s": 0                       # 可选，模拟慢复核（秒）
+      "review_latency_s": 0,                      # 可选，模拟慢复核（秒）
+      "state_machine": "gd"                       # 可选，优先于命令行 --state-machine
     }]}
 
 相对路径相对清单文件所在目录解析。输出目录下每个视频有 ``<name>_rule`` 与
