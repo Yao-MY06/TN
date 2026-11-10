@@ -17,7 +17,7 @@ from __future__ import annotations
 import math
 from bisect import insort
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from ._paths import SM_ROOT  # noqa: F401
@@ -33,6 +33,19 @@ NET_HALF_WIDTH_PX = 30.0
 NET_HOLD_AFTER_S = 0.15
 NET_RETURN_S = 0.30
 NET_ESCAPE_FACTOR = 2.0
+
+
+def unique_state_machine_event_id(event_id: str, counts: Dict[str, int],
+                                  used: set[str]) -> Tuple[str, bool]:
+    """返回一次运行内唯一的 event_id；重复项稳定地加 ``~2``、``~3`` 后缀。"""
+    n = counts.get(event_id, 0) + 1
+    candidate = event_id if n == 1 else f"{event_id}~{n}"
+    while candidate in used:
+        n += 1
+        candidate = f"{event_id}~{n}"
+    counts[event_id] = n
+    used.add(candidate)
+    return candidate, candidate != event_id
 
 
 @dataclass
@@ -57,7 +70,7 @@ class CommitConfig:
     # 网附近反向击球：扣住网带内、NET_TOUCH 后 0.15 s 内的 RACKET_HIT，
     # 用之后 0.3 s 的融合轨迹裁决；默认关闭。
     net_hit_hold: bool = False
-    # 计分状态机：tn（默认，与 run_mixed 一致）/ ttnet11-yolo / ttnet11-ttnet，见 state_machines.py
+    # 计分状态机：tn（默认，与 run_mixed 一致）/ gd* / ttnet11-*，见 state_machines.py
     state_machine: str = "tn"
 
 
@@ -68,6 +81,10 @@ class StreamingReferee:
         from .state_machines import make_state_machine
         self.sm = make_state_machine(self.cfg.state_machine)
         self.source: Optional[rm.MixedEventSource] = None
+        # 状态机只接受一次运行内唯一的 event_id；对外输出仍保留原 ID。
+        self._sm_event_id_counts: Dict[str, int] = {}
+        self._sm_used_event_ids: set[str] = set()
+        self.sm_event_id_renames = 0
         self.out_det = OnlineOutDetector(
             calib, self.cfg.out_min_px, self.cfg.out_gap_s, self.cfg.out_need_descending,
             self.cfg.out_bounce_guard, self.cfg.out_cooldown) if self.cfg.use_out else None
@@ -306,13 +323,23 @@ class StreamingReferee:
         self.event_sources[ev.event_id] = list(ev.sources)
         self.log_lines.append(
             f"  [帧 {obs.frame_id:04d} | {t:6.3f}s] 事件: {ev.type:<11} 半台: {ev.side:<7} ID: {ev.event_id}")
-        for d in sm.update(ev):
+        sm_ev = self._state_machine_event(ev)
+        for d in sm.update(sm_ev):
             self._record_decision(obs, t, d)
             self.source.out_lockout_until = t + cfg.out_after_point_guard
             if cfg.post_point_lockout > 0:
                 self.source.lockout_until = t + cfg.post_point_lockout
         if id(ev) in injected_ids:
             self.release_lag.append((ev.event_id, ev.timestamp_s, self._now_t))
+
+    def _state_machine_event(self, ev: RefereeEvent) -> RefereeEvent:
+        """给状态机一份唯一 event_id 的副本；dumped_events 仍保留原始 ID。"""
+        candidate, renamed = unique_state_machine_event_id(
+            ev.event_id, self._sm_event_id_counts, self._sm_used_event_ids)
+        if not renamed:
+            return ev
+        self.sm_event_id_renames += 1
+        return replace(ev, event_id=candidate)
 
     def _try_resolve_held(self, force: bool = False) -> bool:
         """返回是否已裁决。帧不够且非收尾时继续扣住。"""

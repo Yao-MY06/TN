@@ -1,11 +1,12 @@
 """对比多个计分状态机的批量输出。
 
 只读 ``<video>_<reviewer>`` 目录中已有的 ``eval_extended.json``、``summary.json``、
-``events.jsonl`` 与 ``decisions.jsonl``，不重新运行级联。用法（在 TN 根目录）::
+``events.jsonl``、``decisions.jsonl`` 与 ``fused_obs.jsonl``，不重新运行级联。
+门因归因会用这些已保存记录回放同一个状态机。用法（在 TN 根目录）::
 
     python -m cascade.compare_sm \
         --base outputs/cascade_batch_sm/tn \
-        --compare outputs/cascade_batch_sm/gd outputs/cascade_batch_sm/gd-traj \
+        --compare outputs/cascade_batch_sm/gd outputs/cascade_batch_sm/gd-traj outputs/cascade_batch_sm/gd-nr \
         --out outputs/cascade_batch_sm
 """
 
@@ -17,14 +18,45 @@ import json
 import os
 import re
 import sys
-from collections import OrderedDict
+from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from cascade.committer import unique_state_machine_event_id  # noqa: E402
+from cascade.state_machines import make_state_machine  # noqa: E402
+from core.schemas import RefereeEvent  # noqa: E402
+
 RUN_RE = re.compile(r"^(?P<video>.+)_(?P<reviewer>rule|ttnet)$")
 REVIEWERS = ("rule", "ttnet")
+
+GATE_CAUSE_LABELS = {
+    "EVENT_ID_DUPLICATE": "事件 ID 撞号去重",
+    "NO_RETURN_DISABLED": "NO_RETURN 默认关闭",
+    "SERVE_ADMISSION_INCOMPLETE": "发球准入未完成",
+    "SERVE_PHASE_IGNORED": "发球阶段判罚被忽略",
+    "SPLICE_GUARD": "同侧两弹夹击球",
+    "NO_HIT_REQUIRED": "回合内须有击球",
+    "COOLDOWN_IGNORED": "判分后冷却",
+    "WAITING_SERVE": "未进入可判分回合",
+    "OTHER": "其他/未达判分条件",
+    "NO_TRACE": "没有可回放快照",
+}
+
+
+class _GateLog(dict):
+    def __init__(self, initial: Dict[str, int]) -> None:
+        super().__init__(initial)
+        self.changes: List[Tuple[str, int]] = []
+
+    def __setitem__(self, key: str, value: int) -> None:
+        old = super().get(key, 0)
+        if value != old:
+            self.changes.append((key, value - old))
+        super().__setitem__(key, value)
+
+
 GATE_ORDER = (
     "serve_prep_resets",
     "serve_admission_violations",
@@ -103,6 +135,7 @@ def _load_runs(root: str, pairs: Iterable[Tuple[str, str]]) -> Dict[str, Any]:
             "summary": summary,
             "events": _read_jsonl(os.path.join(run_dir, "events.jsonl")),
             "decisions": _read_jsonl(os.path.join(run_dir, "decisions.jsonl")),
+            "fused_obs": _read_jsonl(os.path.join(run_dir, "fused_obs.jsonl")),
         })
     return {"root": root, "state_machine": state, "runs": runs}
 
@@ -158,6 +191,186 @@ def _aggregate(runs: List[Dict[str, Any]], state: str, reviewer: str, scope: str
                 out["wrong_a"] += 1
             elif side == "B":
                 out["wrong_b"] += 1
+    return out
+
+
+
+def _decision_kind(decision: Any) -> str:
+    kind = getattr(decision, "kind", "")
+    return kind.value if hasattr(kind, "value") else str(kind)
+
+
+def _ctx_snapshot(sm: Any) -> Dict[str, Any]:
+    ctx = getattr(sm, "_ctx", None)
+    return {
+        "last_hitter": getattr(ctx, "last_hitter", None),
+        "last_bounce_side": getattr(ctx, "last_bounce_side", None),
+        "rally_has_hit": getattr(ctx, "rally_has_hit", False),
+        "hit_since_last_bounce": getattr(ctx, "hit_since_last_bounce", False),
+        "serve_own_bounce_seen": getattr(ctx, "serve_own_bounce_seen", False),
+        "cooldown_until": getattr(sm, "_cooldown_until", None),
+    }
+
+
+def _replay_run(run: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """用已保存的 events + fused_obs 回放同一个状态机，仅用于门因归因。"""
+    frames = run.get("fused_obs") or []
+    if not frames:
+        return None
+    sm = make_state_machine(run["state_machine"])
+    gate_log = _GateLog(getattr(sm, "_gate_stats", {}))
+    if hasattr(sm, "_gate_stats"):
+        sm._gate_stats = gate_log
+    events = run.get("events") or []
+    event_i = 0
+    id_counts: Dict[str, int] = {}
+    id_used: set[str] = set()
+    decisions: List[Dict[str, Any]] = []
+    event_records: Dict[Tuple[str, float], Dict[str, Any]] = {}
+    ticks: List[Dict[str, Any]] = []
+    gate_trace: List[Dict[str, Any]] = []
+    for frame in frames:
+        t = float(frame["timestamp_s"])
+        tick_before_state = sm.state.value
+        tick_before_ctx = _ctx_snapshot(sm)
+        gate_log.changes = []
+        tick_decisions = sm.tick(t)
+        if gate_log.changes:
+            gate_trace.append({"t": t, "trigger": "tick", "state": sm.state.value,
+                               "gates": list(gate_log.changes)})
+        tick_rec = {
+            "current_t": t, "trigger": "tick", "event_id": None, "event_t": None,
+            "gate_delta": list(gate_log.changes), "before_state": tick_before_state,
+            "before_ctx": tick_before_ctx, "after_state": sm.state.value,
+        }
+        ticks.append(tick_rec)
+        for d in tick_decisions:
+            decisions.append({
+                "kind": _decision_kind(d), "rule": getattr(d, "rule", None),
+                "winner": getattr(d, "winner", None), "current_t": t,
+                "trigger": "tick", "event_id": None, "event_t": None,
+                "gate_delta": list(gate_log.changes),
+                "before_state": tick_before_state, "before_ctx": tick_before_ctx,
+            })
+        while event_i < len(events) and float(events[event_i].get("timestamp_s", 1e9)) <= t + 1e-9:
+            e = events[event_i]
+            event_i += 1
+            event_t = float(e["timestamp_s"])
+            before_state = sm.state.value
+            before_ctx = _ctx_snapshot(sm)
+            sm_id, _ = unique_state_machine_event_id(e["event_id"], id_counts, id_used)
+            event = RefereeEvent(
+                event_id=sm_id, timestamp_s=event_t, type=e["type"], side=e.get("side", "UNKNOWN"),
+                position_px=tuple(e["position_px"]) if e.get("position_px") else None,
+                confidence=e.get("confidence"))
+            gate_log.changes = []
+            produced = sm.update(event)
+            if gate_log.changes:
+                gate_trace.append({"t": event_t, "trigger": "event", "state": before_state,
+                                   "event_id": e["event_id"], "gates": list(gate_log.changes)})
+            rec = {
+                "event_id": e["event_id"], "event_t": event_t, "event_type": e["type"],
+                "event_side": e.get("side"), "before_state": before_state,
+                "before_ctx": before_ctx, "gate_delta": list(gate_log.changes),
+                "decisions": [(_decision_kind(d), getattr(d, "rule", None),
+                               getattr(d, "winner", None)) for d in produced],
+            }
+            event_records[(e["event_id"], round(event_t, 6))] = rec
+            for d in produced:
+                decisions.append({
+                    "kind": _decision_kind(d), "rule": getattr(d, "rule", None),
+                    "winner": getattr(d, "winner", None), "current_t": t,
+                    "trigger": "event", "event_id": e["event_id"], "event_t": event_t,
+                    "gate_delta": list(gate_log.changes),
+                    "before_state": before_state, "before_ctx": before_ctx,
+                })
+    return {"decisions": decisions, "events": event_records, "ticks": ticks, "gate_trace": gate_trace}
+
+
+def _find_tn_point(replay: Optional[Dict[str, Any]], change: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if replay is None or change.get("tn_t") is None:
+        return None
+    candidates = [d for d in replay["decisions"]
+                  if d.get("kind") == "POINT" and d.get("rule") == change.get("tn_rule")
+                  and d.get("winner") == change.get("tn_winner")
+                  and abs(float(d["current_t"]) - float(change["tn_t"])) <= 0.2]
+    return min(candidates, key=lambda d: abs(float(d["current_t"]) - float(change["tn_t"]))) if candidates else None
+
+
+def _classify_gate_cause(tn_decision: Optional[Dict[str, Any]],
+                         replay_event: Optional[Dict[str, Any]],
+                         no_return_enabled: bool = False) -> Tuple[str, str]:
+    if tn_decision is None:
+        return "NO_TRACE", GATE_CAUSE_LABELS["NO_TRACE"]
+    if tn_decision.get("rule") == "NO_RETURN" and not no_return_enabled:
+        return "NO_RETURN_DISABLED", GATE_CAUSE_LABELS["NO_RETURN_DISABLED"]
+    if replay_event is None:
+        return "OTHER", "TN 判罚事件在对比组回放中无对应记录"
+
+    delta = list(replay_event.get("gate_delta", [])) + list(replay_event.get("recent_gate_delta", []))
+    gates = {name for name, _ in delta}
+    priority = (
+        ("duplicate_event_ids_ignored", "EVENT_ID_DUPLICATE"),
+        ("cooldown_ignored_events", "COOLDOWN_IGNORED"),
+        ("serve_phase_ignored", "SERVE_PHASE_IGNORED"),
+        ("splice_skips", "SPLICE_GUARD"),
+        ("no_hit_skips", "NO_HIT_REQUIRED"),
+        ("serve_admission_violations", "SERVE_ADMISSION_INCOMPLETE"),
+        ("serve_no_hit_blocked", "SERVE_ADMISSION_INCOMPLETE"),
+    )
+    for gate, code in priority:
+        if gate in gates:
+            return code, GATE_CAUSE_LABELS[code]
+
+    state = replay_event.get("before_state")
+    ctx = replay_event.get("before_ctx") or {}
+    if state == "SERVE_IN_PROGRESS":
+        return "SERVE_ADMISSION_INCOMPLETE", GATE_CAUSE_LABELS["SERVE_ADMISSION_INCOMPLETE"]
+    if state == "WAITING_SERVE":
+        return "WAITING_SERVE", GATE_CAUSE_LABELS["WAITING_SERVE"]
+    if state in ("RALLY", "RALLY_END_CANDIDATE") and not ctx.get("rally_has_hit"):
+        return "NO_HIT_REQUIRED", GATE_CAUSE_LABELS["NO_HIT_REQUIRED"]
+    if state == "RALLY" and ctx.get("last_hitter") is None:
+        return "OTHER", "无击球方归属"
+    return "OTHER", GATE_CAUSE_LABELS["OTHER"]
+
+
+def _build_gate_attributions(changes: List[Dict[str, Any]],
+                             roots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    runs = {(run["state_machine"], run["video"], run["reviewer"]): run
+            for root in roots for run in root["runs"]}
+    replays: Dict[Tuple[str, str, str], Optional[Dict[str, Any]]] = {}
+    out: List[Dict[str, Any]] = []
+    for change in changes:
+        if change["change"] != "right_to_wrong":
+            continue
+        base_key = ("tn", change["video"], change["reviewer"])
+        new_key = (change["state_machine"], change["video"], change["reviewer"])
+        if base_key not in runs or new_key not in runs:
+            continue
+        if base_key not in replays:
+            replays[base_key] = _replay_run(runs[base_key])
+        if new_key not in replays:
+            replays[new_key] = _replay_run(runs[new_key])
+        tn_point = _find_tn_point(replays[base_key], change)
+        replay_event = None
+        if tn_point and tn_point.get("event_id") is not None and replays[new_key]:
+            replay_event = replays[new_key]["events"].get(
+                (tn_point["event_id"], round(float(tn_point["event_t"]), 6)))
+        elif tn_point and replays[new_key]:
+            ticks = replays[new_key].get("ticks") or []
+            if ticks:
+                tick = min(ticks, key=lambda x: abs(float(x["current_t"]) - float(tn_point["current_t"])))
+                if abs(float(tick["current_t"]) - float(tn_point["current_t"])) <= 0.05:
+                    replay_event = dict(tick)
+                    recent = [g for g in replays[new_key].get("gate_trace", [])
+                              if float(tn_point["current_t"]) - 8.0 <= float(g["t"])
+                              <= float(tn_point["current_t"]) + 0.05]
+                    if recent:
+                        replay_event["recent_gate_delta"] = list(recent[-1]["gates"])
+        code, label = _classify_gate_cause(
+            tn_point, replay_event, no_return_enabled=change["state_machine"] == "gd-nr")
+        out.append({**change, "cause_code": code, "cause": label})
     return out
 
 
@@ -223,6 +436,8 @@ def build_report(base_dir: str, compare_dirs: List[str]) -> Dict[str, Any]:
                         "reviewer": run["reviewer"], "gt_t": row.get("gt_t"),
                         "gt": row.get("gt"), "gt_winner": row.get("gt_winner"),
                         "tn": _fmt_row(before), "new": _fmt_row(row), "change": change,
+                        "tn_t": before.get("our_t"), "tn_rule": before.get("our_rule"),
+                        "tn_winner": before.get("our_winner"),
                     })
 
     gates: List[Dict[str, Any]] = []
@@ -233,6 +448,7 @@ def build_report(base_dir: str, compare_dirs: List[str]) -> Dict[str, Any]:
                 gates.append({"state_machine": root["state_machine"], "video": run["video"],
                               "reviewer": run["reviewer"], "gates": dict(stats)})
 
+    gate_attributions = _build_gate_attributions(changes, roots)
     diagnostics = [d for root in roots for run in root["runs"] for d in _diagnose_run(run)]
     diag_by: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
     for d in diagnostics:
@@ -246,8 +462,8 @@ def build_report(base_dir: str, compare_dirs: List[str]) -> Dict[str, Any]:
         total["out_event_not_scored"] = sum(d["category"] == "OUT_EVENT_NOT_SCORED"
                                             for d in selected_diag)
     return {"base": base, "roots": roots, "states": states, "reviewers": reviewers,
-            "totals": totals, "changes": changes, "gates": gates,
-            "out_diagnostics": diagnostics}
+            "totals": totals, "changes": changes, "gate_attributions": gate_attributions,
+            "gates": gates, "out_diagnostics": diagnostics}
 
 
 def _md_cell(value: Any) -> str:
@@ -330,8 +546,32 @@ def _render_markdown(report: Dict[str, Any]) -> str:
                          "tn 判罚", "新状态机判罚"], rows) if rows else ["无。"]
         lines += [""]
 
+    lines += ["## b2. 门因归因表", "",
+              "只统计相对 tn 的“原来对→现在错”。依据已保存的 events.jsonl、fused_obs.jsonl 和 decisions.jsonl，"
+              "用同一个状态机回放定位门因；不重新运行级联。", ""]
+    attr_counts = Counter(
+        (a["state_machine"], a["reviewer"], _scope_label("tuning" if a["video"] == "test_2" else "holdout"),
+         a["cause"]) for a in report.get("gate_attributions", []))
+    attr_rows = []
+    for state in report["states"]:
+        for reviewer in report["reviewers"]:
+            for scope in ("test_2", "留出集"):
+                for cause, count in sorted(
+                        ((cause, n) for (s, r, sc, cause), n in attr_counts.items()
+                         if s == state and r == reviewer and sc == scope),
+                        key=lambda item: item[0]):
+                    attr_rows.append([state, reviewer, scope, cause, count])
+    lines += _table(["状态机", "复核", "范围", "门因", "条数"], attr_rows) if attr_rows else ["无改判分。"]
+    lines += [""]
+    detail_rows = [[a["state_machine"], a["video"], a["reviewer"], f"{float(a['gt_t']):.3f}s",
+                    a["gt"], a["tn"], a["new"], a["cause"]]
+                   for a in report.get("gate_attributions", [])]
+    lines += _table(["状态机", "视频", "复核", "真值时间", "结束方式", "tn 判罚",
+                     "新状态机判罚", "门因"], detail_rows) if detail_rows else ["无改判分。"]
+    lines += [""]
+
     lines += ["## c. 门控计数", "",
-              "gd、gd-traj 每道门的触发次数；0 也列出。", ""]
+              "gd、gd-traj、gd-nr 每道门的触发次数；0 也列出。", ""]
     rows = [[g["state_machine"], g["video"], g["reviewer"], _gate_text(g["gates"])]
             for g in report["gates"]]
     lines += _table(["状态机", "视频", "复核", "门控计数"], rows) if rows else ["无门控计数。"]

@@ -6,7 +6,7 @@ import os
 import tempfile
 import unittest
 
-from cascade.compare_sm import build_report, write_report
+from cascade.compare_sm import _classify_gate_cause, build_report, write_report
 
 
 def _write_json(path, data):
@@ -147,7 +147,7 @@ class TestCompareSM(unittest.TestCase):
             self.assertTrue(os.path.isfile(paths["csv"]))
             with open(paths["markdown"], encoding="utf-8") as f:
                 md = f.read()
-            for text in ("合计表", "test_2", "留出集", "逐分改判", "门控计数", "出界诊断",
+            for text in ("合计表", "test_2", "留出集", "逐分改判", "门因归因表", "门控计数", "出界诊断",
                          "原来对→现在错", "原来错→现在对", "没有 OUT 事件"):
                 self.assertIn(text, md)
             holdout_line = next(line for line in md.splitlines()
@@ -160,5 +160,22 @@ class TestCompareSM(unittest.TestCase):
             self.assertIn("missed_out", rows[0])
 
 
+class TestGateCause(unittest.TestCase):
+    def test_classifier_prioritizes_duplicate_and_defaults(self):
+        point = {"kind": "POINT", "rule": "OUT", "winner": "A"}
+        rec = {"before_state": "RALLY", "before_ctx": {}, "event_type": "OUT",
+               "gate_delta": [("duplicate_event_ids_ignored", 1)]}
+        self.assertEqual(_classify_gate_cause(point, rec)[0], "EVENT_ID_DUPLICATE")
+
+        no_return = {"kind": "POINT", "rule": "NO_RETURN", "winner": "A"}
+        self.assertEqual(_classify_gate_cause(no_return, None)[0], "NO_RETURN_DISABLED")
+
+        serve = {"before_state": "SERVE_IN_PROGRESS", "before_ctx": {},
+                 "event_type": "BOUNCE", "gate_delta": []}
+        self.assertEqual(_classify_gate_cause(point, serve)[0], "SERVE_ADMISSION_INCOMPLETE")
+
+        no_hit = {"before_state": "RALLY_END_CANDIDATE",
+                  "before_ctx": {"rally_has_hit": False}, "gate_delta": []}
+        self.assertEqual(_classify_gate_cause(no_return, no_hit, no_return_enabled=True)[0], "NO_HIT_REQUIRED")
 if __name__ == "__main__":
     unittest.main()

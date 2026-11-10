@@ -135,7 +135,7 @@ class TestRunBatchCLI(unittest.TestCase):
         parser = _build_parser()
         self.assertEqual(parser.parse_args(["--manifest", "x"]).state_machine, "tn")
         self.assertEqual(parser.parse_args(
-            ["--manifest", "x", "--state-machine", "gd-traj"]).state_machine, "gd-traj")
+            ["--manifest", "x", "--state-machine", "gd-nr"]).state_machine, "gd-nr")
 
 
 class TestManifestExample(unittest.TestCase):

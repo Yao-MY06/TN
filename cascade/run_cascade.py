@@ -249,6 +249,7 @@ class CascadeCore:
             "reviewer": self.reviewer_name,
             "state_machine": self.commit_cfg.state_machine,
             "sm_gates": gate_stats(self.referee.sm),
+            "state_machine_event_id_renames": self.referee.sm_event_id_renames,
             "frames": self._frames, "duration_s": round(t1 - t0, 3),
             "score": {"A": self.referee.score[0], "B": self.referee.score[1]},
             "decisions": self.referee.decisions,
@@ -550,7 +551,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--no-jitter-merge", action="store_true")
     ap.add_argument("--no-out", action="store_true")
     ap.add_argument("--state-machine", default="tn", choices=CHOICES,
-                    help="计分状态机：tn=TN 共用版（默认）；gd/gd-traj=国栋门控版；ttnet11-*")
+                    help="计分状态机：tn=TN 共用版（默认）；gd/gd-traj=国栋门控版；gd-nr=仅归因；ttnet11-*")
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--quiet", action="store_true")
     add_ttnet_args(ap)

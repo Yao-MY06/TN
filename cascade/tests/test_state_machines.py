@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TN_ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -11,10 +12,11 @@ if TN_ROOT not in sys.path:
     sys.path.insert(0, TN_ROOT)
 
 from cascade._paths import EXAMPLES_DIR  # noqa: E402
-from cascade.committer import CommitConfig  # noqa: E402
+from cascade.committer import CommitConfig, StreamingReferee  # noqa: E402
 from cascade.run_cascade import run, write_outputs  # noqa: E402
 from cascade.state_machines import (CHOICES, GD_ROOT, TTNET11_ROOT, _load_gd,  # noqa: E402
                                       gate_stats, make_state_machine)
+from core.schemas import RefereeEvent  # noqa: E402
 
 OBS = os.path.join(EXAMPLES_DIR, "test_2_observations.jsonl")
 HAS_11 = os.path.isfile(os.path.join(TTNET11_ROOT, "src", "referee", "yolo_sm", "ttnet_state_machine.py"))
@@ -46,6 +48,7 @@ class TestGdChoices(unittest.TestCase):
     def test_choices_include_gd_variants(self):
         self.assertIn("gd", CHOICES)
         self.assertIn("gd-traj", CHOICES)
+        self.assertIn("gd-nr", CHOICES)
 
 
 @unittest.skipUnless(HAS_GD, "缺国栋仓库：" + GD_ROOT)
@@ -56,14 +59,17 @@ class TestGd(unittest.TestCase):
         self.assertIsInstance(gates, dict)
         self.assertIn("serve_no_hit_blocked", gates)
         self.assertIsNone(gate_stats(make_state_machine("tn")))
+        self.assertFalse(make_state_machine("gd").rules.enable_no_return)
+        self.assertTrue(make_state_machine("gd-nr").rules.enable_no_return)
 
     def test_gd_rule_run_and_outputs(self):
-        for kind in ("gd", "gd-traj"):
+        for kind in ("gd", "gd-traj", "gd-nr"):
             with self.subTest(kind=kind):
                 res = run(OBS, preset="test2", commit=CommitConfig(state_machine=kind))
                 summary = res["summary"]
                 self.assertEqual(summary["state_machine"], kind)
                 self.assertIsInstance(summary["sm_gates"], dict)
+                self.assertIsInstance(summary["state_machine_event_id_renames"], int)
                 self.assertEqual(set(summary["score"]), {"A", "B"})
                 with tempfile.TemporaryDirectory() as tmp:
                     write_outputs(tmp, res)
@@ -73,6 +79,39 @@ class TestGd(unittest.TestCase):
                     self.assertIsInstance(written["sm_gates"], dict)
 
 
+class TestStateMachineEventIds(unittest.TestCase):
+    def _feed_duplicate_out(self, kind):
+        ref = StreamingReferee(object(), CommitConfig(state_machine=kind, use_out=False))
+        seen = []
+        original_update = ref.sm.update
+
+        def recording_update(event):
+            seen.append(event.event_id)
+            return original_update(event)
+
+        ref.sm.update = recording_update
+        obs = SimpleNamespace(source="tracknet", frame_id=1)
+        for timestamp in (1.0, 2.0):
+            ref._emit_event(
+                RefereeEvent(event_id="out_00001", timestamp_s=timestamp,
+                             type="OUT", side="A"),
+                obs, timestamp, set())
+        return ref, seen
+
+    def test_duplicate_out_ids_are_unique_only_inside_state_machine(self):
+        ref, seen = self._feed_duplicate_out("gd")
+        self.assertEqual(seen, ["out_00001", "out_00001~2"])
+        self.assertEqual([e["event_id"] for e in ref.dumped_events],
+                         ["out_00001", "out_00001"])
+        self.assertEqual(ref.sm_event_id_renames, 1)
+        self.assertEqual(gate_stats(ref.sm)["duplicate_event_ids_ignored"], 0)
+
+    def test_tn_dumped_event_ids_remain_unchanged(self):
+        ref, seen = self._feed_duplicate_out("tn")
+        self.assertEqual(seen, ["out_00001", "out_00001~2"])
+        self.assertEqual([e["event_id"] for e in ref.dumped_events],
+                         ["out_00001", "out_00001"])
+        self.assertEqual(ref.sm_event_id_renames, 1)
 class TestGdLoaderErrors(unittest.TestCase):
     def test_missing_repository_has_clear_error(self):
         with tempfile.TemporaryDirectory() as tmp:
