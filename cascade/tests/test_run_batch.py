@@ -6,7 +6,7 @@ import os
 import tempfile
 import unittest
 
-from cascade.run_batch import aggregate_holdout, run_batch
+from cascade.run_batch import _build_parser, aggregate_holdout, run_batch
 
 TN_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OBS = os.path.join(TN_ROOT, "adapter", "examples", "test_2_observations.jsonl")
@@ -80,6 +80,26 @@ class TestRunBatchTest2(unittest.TestCase):
             self.assertIn("ttnet_outside_truth_misses", rows[0])
             self.assertEqual(rows[0]["rule_f1"], "0.842")
 
+    def test_manifest_state_machine_overrides_cli(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = os.path.join(tmp, "manifest.json")
+            with open(manifest, "w", encoding="utf-8") as f:
+                json.dump({"videos": [{
+                    "name": "test_2", "split": "tuning", "preset": "test2",
+                    "tracknet": OBS, "events_markup": MARKUP, "extended": EXTENDED,
+                    "state_machine": "gd",
+                }]}, f)
+            out = os.path.join(tmp, "out")
+            result = run_batch(manifest, out, state_machine="tn")
+            with open(os.path.join(out, "test_2_rule", "summary.json"), encoding="utf-8") as f:
+                summary = json.load(f)
+            self.assertEqual(summary["commit"]["state_machine"], "gd")
+            self.assertEqual(summary["state_machine"], "gd")
+            self.assertIsInstance(summary["sm_gates"], dict)
+            with open(result["summary_md"], encoding="utf-8") as f:
+                md = f.read()
+            self.assertIn("状态机: `gd`", md)
+
     def test_ttnet_path_and_outside_column(self):
         with open(MARKUP, encoding="utf-8") as f:
             markup = {int(k): v for k, v in json.load(f).items()}
@@ -108,6 +128,14 @@ class TestRunBatchTest2(unittest.TestCase):
             self.assertEqual(row["ttnet"]["ttnet_outside_truth_misses"], 0)
             self.assertTrue(os.path.isfile(os.path.join(
                 tmp, "out", "test_2_ttnet", "eval_ttnet_outside.json")))
+
+
+class TestRunBatchCLI(unittest.TestCase):
+    def test_state_machine_defaults_to_tn_and_accepts_gd(self):
+        parser = _build_parser()
+        self.assertEqual(parser.parse_args(["--manifest", "x"]).state_machine, "tn")
+        self.assertEqual(parser.parse_args(
+            ["--manifest", "x", "--state-machine", "gd-traj"]).state_machine, "gd-traj")
 
 
 class TestManifestExample(unittest.TestCase):

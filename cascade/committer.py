@@ -26,7 +26,7 @@ from .online_out import OnlineOutDetector
 import run_mixed as rm  # noqa: E402  (tt/run_mixed.py)
 from core.schemas import EventType, FrameObservation, RefereeEvent  # noqa: E402
 from core.state_machine import MatchRules, TableTennisStateMachine  # noqa: E402
-from core.trajectory_processor import TrajectoryEventProcessor  # noqa: E402
+from .state_machines import trajectory_processor_class  # noqa: E402
 
 _EPS = 1e-6
 NET_HALF_WIDTH_PX = 30.0
@@ -230,7 +230,7 @@ class StreamingReferee:
         cfg, sm = self.cfg, self.sm
         if self.source is None:
             src = obs.source.value if hasattr(obs.source, "value") else str(obs.source)
-            inner = TrajectoryEventProcessor(self.calib, source=src)
+            inner = trajectory_processor_class(cfg.state_machine)(self.calib, source=src)
             self.source = rm.MixedEventSource(
                 inner, [], drop_inner=not cfg.keep_inner_bounce, delay_s=cfg.bounce_delay, sm=sm,
                 dropouts=None, serve_guard_lookback=cfg.serve_guard_lookback,
