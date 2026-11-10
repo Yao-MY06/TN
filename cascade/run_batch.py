@@ -37,7 +37,9 @@ if __package__ in (None, ""):
 from cascade.eval_extended import evaluate as evaluate_extended
 from cascade.eval_proposals import evaluate as evaluate_proposals
 from cascade.eval_ttnet_outside import evaluate as evaluate_ttnet_outside
+from cascade.committer import CommitConfig
 from cascade.run_cascade import run, write_outputs
+from cascade.state_machines import CHOICES
 from cascade.ttnet_reviewer import DEFAULT_K
 
 
@@ -109,7 +111,8 @@ def _reviewer_stats(eval_prop: Dict[str, Any], eval_ext: Optional[Dict[str, Any]
     }
 
 
-def _run_entry(entry: Dict[str, Any], manifest_dir: str, out_dir: str) -> Dict[str, Any]:
+def _run_entry(entry: Dict[str, Any], manifest_dir: str, out_dir: str,
+               state_machine: str = "tn") -> Dict[str, Any]:
     name = str(entry.get("name") or "").strip()
     if not name:
         raise ValueError("清单项缺少 name")
@@ -128,6 +131,9 @@ def _run_entry(entry: Dict[str, Any], manifest_dir: str, out_dir: str) -> Dict[s
     deadline = float(entry.get("review_deadline_s", entry.get("review_deadline_frames", 0) / fps))
     latency = float(entry.get("review_latency_s", entry.get("review_latency_frames", 0) / fps))
     split = str(entry.get("split") or ("tuning" if name in ("test_2", "test2") else "holdout"))
+    sm = str(entry.get("state_machine") or state_machine)
+    if sm not in CHOICES:
+        raise ValueError(f"{name}: 未知状态机 {sm!r}，可选 {CHOICES}")
 
     if not tracknet or not os.path.isfile(tracknet):
         raise FileNotFoundError(f"{name}: TrackNet 观测不存在: {tracknet}")
@@ -145,7 +151,7 @@ def _run_entry(entry: Dict[str, Any], manifest_dir: str, out_dir: str) -> Dict[s
     row: Dict[str, Any] = {
         "video": name, "split": split, "frames": None,
         "proposal_recall": None, "coverage": None, "ttnet_window_ratio": None,
-        "rule": None, "ttnet": None, "notes": [],
+        "rule": None, "ttnet": None, "notes": [], "state_machine": sm,
     }
     if not ttnet_cache:
         row["notes"].append("缺 TTNet 缓存，未跑 ttnet 组")
@@ -165,6 +171,7 @@ def _run_entry(entry: Dict[str, Any], manifest_dir: str, out_dir: str) -> Dict[s
         res = run(
             tracknet, preset=preset, quad=quad, reviewer=reviewer,
             yolo_jsonl=yolo, review_latency_s=latency,
+            commit=CommitConfig(state_machine=sm),
             review_deadline_s=deadline,
             pre_ctx=(8 - int(entry.get("ttnet_k", DEFAULT_K))) if reviewer == "ttnet" else 0,
             post_ctx=int(entry.get("ttnet_k", DEFAULT_K)) if reviewer == "ttnet" else 0,
@@ -324,7 +331,8 @@ CSV_FIELDS = [
 ]
 
 
-def _write_summary(out_dir: str, rows: List[Dict[str, Any]], total: Optional[Dict[str, Any]]) -> None:
+def _write_summary(out_dir: str, rows: List[Dict[str, Any]], total: Optional[Dict[str, Any]],
+                  state_machines: List[str]) -> None:
     display = [_display_row(r) for r in rows]
     if total is not None:
         display.append(_display_row(total))
@@ -337,7 +345,8 @@ def _write_summary(out_dir: str, rows: List[Dict[str, Any]], total: Optional[Dic
     headers = ["视频", "划分", "帧数", "提议召回", "覆盖", "TTNet窗口", "规则 P/R/F1",
                "TTNet P/R/F1", "空档检出(规则/TTNet)", "规则得分", "TTNet得分", "多判(规则/TTNet)",
                "人工确认(规则/TTNet)", "超时(规则/TTNet)", "片段外真值漏检", "备注"]
-    lines = ["# 级联批量汇总", "",
+    sm_note = " / ".join(dict.fromkeys(state_machines)) if state_machines else "tn"
+    lines = [f"# 级联批量汇总（状态机: `{sm_note}`）", "",
              "| " + " | ".join(headers) + " |",
              "|" + "|".join(["---"] * len(headers)) + "|"]
     for d in display:
@@ -366,26 +375,34 @@ def _write_summary(out_dir: str, rows: List[Dict[str, Any]], total: Optional[Dic
         f.write("\n".join(lines))
 
 
-def run_batch(manifest: str, out_dir: str) -> Dict[str, Any]:
+def run_batch(manifest: str, out_dir: str, state_machine: str = "tn") -> Dict[str, Any]:
+    if state_machine not in CHOICES:
+        raise ValueError(f"未知状态机 {state_machine!r}，可选 {CHOICES}")
     manifest = os.path.abspath(manifest)
     out_dir = os.path.abspath(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     manifest_dir = os.path.dirname(manifest)
     entries = _load_manifest(manifest)
-    rows = [_run_entry(entry, manifest_dir, out_dir) for entry in entries]
+    rows = [_run_entry(entry, manifest_dir, out_dir, state_machine) for entry in entries]
     total = aggregate_holdout(rows)
-    _write_summary(out_dir, rows, total)
+    effective = [str(entry.get("state_machine") or state_machine) for entry in entries]
+    _write_summary(out_dir, rows, total, effective)
     return {"rows": rows, "holdout_total": total,
             "summary_md": os.path.join(out_dir, "summary.md"),
             "summary_csv": os.path.join(out_dir, "summary.csv")}
 
 
-def main(argv=None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="批量运行 rule/ttnet 级联并生成汇总表")
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--out-dir", default=os.path.join("outputs", "cascade_batch"))
-    a = ap.parse_args(argv)
-    result = run_batch(a.manifest, a.out_dir)
+    ap.add_argument("--state-machine", default="tn", choices=CHOICES,
+                    help="计分状态机；清单项的 state_machine 优先")
+    return ap
+
+def main(argv=None) -> int:
+    a = _build_parser().parse_args(argv)
+    result = run_batch(a.manifest, a.out_dir, state_machine=a.state_machine)
     print(f"汇总表：{result['summary_md']}")
     print(f"CSV   ：{result['summary_csv']}")
     return 0

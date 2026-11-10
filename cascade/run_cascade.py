@@ -38,6 +38,7 @@ from cascade.proposals import ProposalGenerator, ProposalParams  # noqa: E402
 from cascade.review_queue import build_review_queue  # noqa: E402
 from cascade.reviewers import OracleReviewer, ReviewResult, RuleReviewer  # noqa: E402
 from cascade.scheduler import ClipScheduler  # noqa: E402
+from cascade.state_machines import CHOICES, gate_stats  # noqa: E402
 from cascade.ttnet_reviewer import add_ttnet_args, build_ttnet_reviewer  # noqa: E402
 
 import run_mixed as rm  # noqa: E402
@@ -246,6 +247,8 @@ class CascadeCore:
         summary = {
             "input": self.input_name, "preset": getattr(self, "preset", ""),
             "reviewer": self.reviewer_name,
+            "state_machine": self.commit_cfg.state_machine,
+            "sm_gates": gate_stats(self.referee.sm),
             "frames": self._frames, "duration_s": round(t1 - t0, 3),
             "score": {"A": self.referee.score[0], "B": self.referee.score[1]},
             "decisions": self.referee.decisions,
@@ -546,8 +549,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--dropout-min-s", type=float, default=0.05, help="台面附近持续丢球多久才提议（秒）")
     ap.add_argument("--no-jitter-merge", action="store_true")
     ap.add_argument("--no-out", action="store_true")
-    ap.add_argument("--state-machine", default="tn", choices=["tn", "ttnet11-yolo", "ttnet11-ttnet"],
-                    help="计分状态机：tn=TN 共用版（默认）；ttnet11-*=chagoup/TTNet1.1 的 TTNetStateMachine 两个档位")
+    ap.add_argument("--state-machine", default="tn", choices=CHOICES,
+                    help="计分状态机：tn=TN 共用版（默认）；gd/gd-traj=国栋门控版；ttnet11-*")
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--quiet", action="store_true")
     add_ttnet_args(ap)

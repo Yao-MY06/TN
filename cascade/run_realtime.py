@@ -24,6 +24,7 @@ from cascade.realtime.workers import (TTNetWorker, TrackNetWorker, YoloWorker,
                                       make_tracknet_batch_predictor, make_yolo_predictor)
 from cascade.reviewers import RuleReviewer
 from cascade.run_cascade import CascadeCore, _pct, write_outputs
+from cascade.state_machines import CHOICES
 from cascade.ttnet_reviewer import DEFAULT_K, detections_from_observations
 from core.geometry import CALIBRATION_PRESETS
 
@@ -405,7 +406,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dropout-min-s", type=float, default=0.05)
     ap.add_argument("--no-jitter-merge", action="store_true")
     ap.add_argument("--no-out", action="store_true")
-    ap.add_argument("--state-machine", choices=["tn", "ttnet11-yolo", "ttnet11-ttnet"], default="tn")
+    ap.add_argument("--state-machine", choices=CHOICES, default="tn")
     ap.add_argument("--yolo-imgsz", type=int, default=960)
     ap.add_argument("--yolo-conf", type=float, default=0.18)
     ap.add_argument("--yolo-device", default=None)
