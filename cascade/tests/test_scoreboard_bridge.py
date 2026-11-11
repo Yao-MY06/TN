@@ -75,27 +75,108 @@ class TestScoreboardBridge(unittest.TestCase):
         actions = [entry.get("action") for entry in bridge.logs]
         self.assertIn("reject_pending_before_point", actions)
 
-    def test_voice_text_undo_and_confirm_dead_ball(self):
+    def _text_runtime(self, bridge):
+        """不读 stdin 的文本模式运行器：手工装上 Pipeline，口令直接放进队列。"""
         try:
-            from tt_referee.voice_compat import SharedScoreBoard
             from tt_voice.app import Pipeline
             from tt_voice.config import load_config
             from tt_voice.feedback import NullSpeaker
         except Exception as exc:
             self.skipTest(f"语音文本依赖不可用：{exc}")
+        from cascade.run_scoreboard import ScoreboardRuntime
+        cfg = load_config()
+        runtime = ScoreboardRuntime(bridge, voice="none", quiet=True)
+        runtime.pipeline = Pipeline(cfg, engine=None, board=bridge.board,
+                                    speaker=NullSpeaker(), start_awake=True)
+        runtime._wake_words = sorted(cfg.wake_words, key=len, reverse=True)
+        return runtime
 
+    def test_voice_text_undo_and_confirm_dead_ball(self):
         bridge = self._bridge(pending_timeout_s=30.0)
-        pipe = Pipeline(load_config(), engine=None, board=bridge.board,
-                        speaker=NullSpeaker(), start_awake=True)
-        bridge.apply_decision(_point("A", "OUT", 1.0), 1.0)
-        pipe.push_text("小裁判 撤销上一分", now=2.0)
-        self.assertEqual(bridge.engine.points, {"A": 0, "B": 0})
+        runtime = self._text_runtime(bridge)
+        try:
+            bridge.apply_decision(_point("A", "OUT", 1.0), 1.0)
+            runtime._queue.put(("text", "小裁判 撤销上一分"))   # 唤醒词与口令同句
+            runtime.poll(2.0)
+            self.assertEqual(bridge.engine.points, {"A": 0, "B": 0})
 
-        bridge.apply_decision(_dead("NO_EVIDENCE", 3.0), 3.0)
-        self.assertEqual(bridge.engine.pending["side"], "UNKNOWN")
-        pipe.push_text("小裁判 左方加一分", now=4.0)
-        self.assertIsNone(bridge.engine.pending)
-        self.assertEqual(bridge.engine.points, {"A": 1, "B": 0})
+            bridge.apply_decision(_dead("NO_EVIDENCE", 3.0), 3.0)
+            self.assertEqual(bridge.engine.pending["side"], "UNKNOWN")
+            runtime._queue.put(("text", "小裁判 左方加一分"))
+            runtime.poll(4.0)
+            self.assertIsNone(bridge.engine.pending)
+            self.assertEqual(bridge.engine.points, {"A": 1, "B": 0})
+
+            runtime._queue.put(("text", "撤销上一分"))            # 只写口令也行
+            runtime.poll(5.0)
+            self.assertEqual(bridge.engine.points, {"A": 0, "B": 0})
+        finally:
+            runtime.close()
+
+    def test_text_command_after_session_ended_rewakes(self):
+        bridge = self._bridge(pending_timeout_s=30.0)
+        runtime = self._text_runtime(bridge)
+        try:
+            from tt_voice.app import STATE_IDLE
+            runtime.pipeline.state = STATE_IDLE                  # 模拟聆听窗口已结束
+            runtime._queue.put(("text", "左方加一分"))
+            runtime.poll(1.0)
+            self.assertEqual(bridge.engine.points, {"A": 1, "B": 0})
+        finally:
+            runtime.close()
+
+    def test_mic_mode_builds_asr_engine(self):
+        try:
+            import tt_voice.audio_io as audio_io
+            import tt_voice.engines as engines
+        except Exception as exc:
+            self.skipTest(f"语音依赖不可用：{exc}")
+        from cascade.run_scoreboard import ScoreboardRuntime
+
+        class FakeEngine:
+            name = "fake"
+            model = object()
+
+            def __init__(self):
+                self.started = self.closed = False
+
+            def start(self):
+                self.started = True
+
+            def set_mode(self, mode):
+                self.mode = mode
+
+            def feed(self, pcm):
+                return []
+
+            def close(self):
+                self.closed = True
+
+        class FakeMic:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def __iter__(self):
+                return iter(())
+
+        fake = FakeEngine()
+        saved = (engines.build_engine, audio_io.MicSource)
+        engines.build_engine = lambda cfg, *a, **k: fake
+        audio_io.MicSource = FakeMic
+        try:
+            runtime = ScoreboardRuntime(self._bridge(), voice="mic", quiet=True)
+            self.assertIs(runtime.pipeline.engine, fake)
+            self.assertTrue(fake.started)
+            runtime.close()
+            self.assertTrue(fake.closed)
+        finally:
+            engines.build_engine, audio_io.MicSource = saved
 
     def test_unknown_pending_confirm_keeps_pending_and_requests_side(self):
         bridge = self._bridge(pending_timeout_s=30.0)

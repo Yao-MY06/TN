@@ -80,6 +80,10 @@ def _load_gd(filename: str, root: str = GD_ROOT):
     gd_schemas = os.path.join(root, "core", "schemas.py")
     if _norm_text(gd_schemas) != _norm_text(_schemas.__file__):
         raise RuntimeError("国栋仓库的 core/schemas.py 与 TN core 不一致，事件类型不能混用；先核对版本")
+    if filename == "state_machine.py" and "_gate_stats" not in _norm_text(path):
+        raise RuntimeError(
+            f"国栋仓库版本过旧：{path} 没有门控版状态机（需要 main 73ea183 或更新，"
+            "fusion/three-way 的 third_party 快照是旧版）")
     name = "cascade_gd_" + os.path.splitext(filename)[0]
     if name in sys.modules:
         return sys.modules[name]
@@ -92,6 +96,19 @@ def _load_gd(filename: str, root: str = GD_ROOT):
         sys.modules.pop(name, None)
         raise
     return mod
+
+
+def gd_status(root: str = GD_ROOT) -> Optional[str]:
+    """国栋门控版是否可用：可用返回 None，否则返回原因（测试用来 skip，命令行用来报错）。"""
+    sm_path = os.path.join(root, "core", "state_machine.py")
+    sc_path = os.path.join(root, "core", "schemas.py")
+    if not (os.path.isfile(sm_path) and os.path.isfile(sc_path)):
+        return f"缺国栋仓库：{root}"
+    if _norm_text(sc_path) != _norm_text(_schemas.__file__):
+        return f"国栋仓库 core/schemas.py 与 TN core 不一致：{root}"
+    if "_gate_stats" not in _norm_text(sm_path):
+        return f"国栋仓库版本过旧（无门控版状态机，需要 73ea183 或更新）：{root}"
+    return None
 
 
 def trajectory_processor_class(kind: str = "tn"):

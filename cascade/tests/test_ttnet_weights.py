@@ -18,7 +18,8 @@ import numpy as np
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WEIGHTS = os.environ.get('TTNET_WEIGHTS', os.path.join(_ROOT, '_data', 'weights', 'ttnet.pth'))
-TTNET_SRC = os.environ.get('TTNET_SRC', os.path.join(os.path.dirname(_ROOT), 'TTNet', 'src'))
+from cascade._paths import TTNET_ROOT  # noqa: E402
+TTNET_SRC = os.environ.get('TTNET_SRC', os.path.join(TTNET_ROOT, 'src'))
 N_FRAMES = int(os.environ.get('TTNET_TEST_FRAMES', '20'))
 
 try:
