@@ -260,6 +260,7 @@ python -m cascade.run_cascade --jsonl _data/obs/tracknet/test_4.jsonl \
 | `run_batch.py` | 按清单批量跑 rule / ttnet，生成 `summary.md` / `summary.csv` 与 holdout 池化合计；支持 `--state-machine` |
 | `compare_sm.py` | 只读批量输出，比较多个状态机的判分、门因归因、门控计数与出界诊断 |
 | `render_video.py` | 事后把一次运行画成带 HUD 的视频（球位来源、复核区间状态、事件、比分、时间轴） |
+| `racket_cache.py` | 视频 → 逐帧球拍观测缓存（racket.v1，朗然的 `pingpong-racket-detector`，侧别按本机位网线 x 判定），原机用 |
 | `run_realtime.py` | 实时层入口：视频/空帧源、并行 YOLO/TrackNet/TTNet worker、有界队列与运行统计；可接计分牌 |
 | `scoreboard_bridge.py` | 级联判罚 → 语音仓库 `ScoreEngine` 的映射、待确认超时与日志 |
 | `run_scoreboard.py` | 回放判罚驱动计分 UI/语音，并写 `scoreboard_log.jsonl` / `scoreboard_final.json` |
