@@ -14,13 +14,14 @@ if TN_ROOT not in sys.path:
 from cascade._paths import EXAMPLES_DIR  # noqa: E402
 from cascade.committer import CommitConfig, StreamingReferee  # noqa: E402
 from cascade.run_cascade import run, write_outputs  # noqa: E402
-from cascade.state_machines import (CHOICES, GD_ROOT, TTNET11_ROOT, _load_gd,  # noqa: E402
+from cascade.state_machines import (CHOICES, GD_ROOT, TTNET11_ROOT, _load_gd, gd_status,  # noqa: E402
                                       gate_stats, make_state_machine)
 from core.schemas import RefereeEvent  # noqa: E402
 
 OBS = os.path.join(EXAMPLES_DIR, "test_2_observations.jsonl")
 HAS_11 = os.path.isfile(os.path.join(TTNET11_ROOT, "src", "referee", "yolo_sm", "ttnet_state_machine.py"))
-HAS_GD = os.path.isfile(os.path.join(GD_ROOT, "core", "state_machine.py")) and os.path.isfile(os.path.join(GD_ROOT, "core", "schemas.py"))
+GD_REASON = gd_status()
+HAS_GD = GD_REASON is None
 
 
 class TestDefault(unittest.TestCase):
@@ -51,7 +52,7 @@ class TestGdChoices(unittest.TestCase):
         self.assertIn("gd-nr", CHOICES)
 
 
-@unittest.skipUnless(HAS_GD, "缺国栋仓库：" + GD_ROOT)
+@unittest.skipUnless(HAS_GD, GD_REASON or "")
 class TestGd(unittest.TestCase):
     def test_gd_constructs_and_exposes_gate_stats(self):
         sm = make_state_machine("gd")
@@ -127,6 +128,19 @@ class TestGdLoaderErrors(unittest.TestCase):
             with open(os.path.join(core, "schemas.py"), "w", encoding="utf-8") as f:
                 f.write("# deliberately different\n")
             with self.assertRaisesRegex(RuntimeError, "schemas.py.*不一致"):
+                _load_gd("state_machine.py", root=tmp)
+
+    def test_old_snapshot_without_gates_has_clear_error(self):
+        import shutil
+        import core.schemas as tn_schemas
+        with tempfile.TemporaryDirectory() as tmp:
+            core = os.path.join(tmp, "core")
+            os.makedirs(core)
+            shutil.copyfile(tn_schemas.__file__, os.path.join(core, "schemas.py"))
+            with open(os.path.join(core, "state_machine.py"), "w", encoding="utf-8") as f:
+                f.write("class TableTennisStateMachine:\n    pass\n")
+            self.assertIn("版本过旧", gd_status(tmp))
+            with self.assertRaisesRegex(RuntimeError, "版本过旧"):
                 _load_gd("state_machine.py", root=tmp)
 if __name__ == "__main__":
     unittest.main()

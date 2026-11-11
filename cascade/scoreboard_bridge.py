@@ -11,9 +11,8 @@ import os
 import sys
 from typing import Any, Dict, List, Optional
 
-from ._paths import PPQ_ROOT
+from ._paths import VOICE_ROOT
 
-VOICE_ROOT = os.path.join(PPQ_ROOT, "pingpong-voice-referee")
 
 
 def ensure_voice_path(root: str = VOICE_ROOT) -> str:
@@ -21,7 +20,7 @@ def ensure_voice_path(root: str = VOICE_ROOT) -> str:
     root = os.path.abspath(root)
     if not os.path.isdir(os.path.join(root, "tt_referee")):
         raise FileNotFoundError(
-            f"找不到语音仓库 tt_referee：{root}（需要 ppq/pingpong-voice-referee）")
+            f"找不到语音仓库 tt_referee：{root}（按 cascade/_paths.py 的顺序查找 pingpong-voice-referee，或设环境变量 PPQ_ROOT）")
     loaded = sys.modules.get("tt_referee")
     if loaded is not None:
         origin = os.path.abspath(getattr(loaded, "__file__", "") or "")

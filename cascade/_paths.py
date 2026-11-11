@@ -21,8 +21,12 @@ TRACKNET_DIR = os.path.join(TN_ROOT, "TrackNet", "TrackNet")
 CALIB_QUADS = os.path.join(TN_ROOT, "calib", "table_quads.json")
 EXAMPLES_DIR = os.path.join(TN_ROOT, "adapter", "examples")
 
-# 三个仓库并排放在同一个父目录下（ppq/TN、ppq/TTNet、ppq/pingpong-smart-referee）
-PPQ_ROOT = os.path.dirname(TN_ROOT)
+# 同组仓库的位置。两种布局都要支持：
+#   本机：ppq/TN、ppq/TTNet、ppq/pingpong-voice-referee …… 并排（TN 的上一级是项目根）；
+#   原机：TN 仓库本身就克隆在 ppq/，其他仓库放在它里面（ppq/pingpong-voice-referee），
+#         fusion/three-way 分支另带 TN/third_party/ 快照。
+# 查找顺序：环境变量 PPQ_ROOT（或 TN 的上一级）→ TN 根目录 → TN/third_party。
+PPQ_ROOT = os.environ.get("PPQ_ROOT") or os.path.dirname(TN_ROOT)
 THIRD_PARTY = os.path.join(TN_ROOT, "third_party")
 
 
@@ -33,12 +37,16 @@ def _first_existing(*cands):
     return cands[0]
 
 
-# 优先用并排的独立仓库；没有时用本仓库 third_party/ 下的副本（fusion/three-way 分支自带）
-TTNET_ROOT = _first_existing(os.path.join(PPQ_ROOT, "TTNet"), os.path.join(PPQ_ROOT, "TTNet1.1"),
-                             os.path.join(THIRD_PARTY, "TTNet1.1"))
-TTNET11_ROOT = _first_existing(os.path.join(PPQ_ROOT, "TTNet1.1"), os.path.join(THIRD_PARTY, "TTNet1.1"))
-YOLO_ROOT = _first_existing(os.path.join(PPQ_ROOT, "pingpong-smart-referee"),
-                            os.path.join(THIRD_PARTY, "pingpong-smart-referee"))
+def find_repo(*names: str) -> str:
+    """按上面的顺序找第一个存在的同组仓库目录；都不存在时返回第一个候选（报错信息用）。"""
+    cands = [os.path.join(base, n) for base in (PPQ_ROOT, TN_ROOT, THIRD_PARTY) for n in names]
+    return _first_existing(*cands)
+
+
+TTNET_ROOT = find_repo("TTNet", "TTNet1.1")
+TTNET11_ROOT = find_repo("TTNet1.1")
+YOLO_ROOT = find_repo("pingpong-smart-referee")
+VOICE_ROOT = find_repo("pingpong-voice-referee")
 
 for _p in (SM_ROOT, TT_DIR, ADAPTER_DIR):
     if _p not in sys.path:

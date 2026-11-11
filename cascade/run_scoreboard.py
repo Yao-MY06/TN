@@ -76,12 +76,24 @@ class ScoreboardRuntime:
         except Exception as exc:
             raise RuntimeError(f"语音模块依赖不可用：{exc}") from exc
         cfg = load_config()
+        self._wake_words = sorted((w for w in cfg.wake_words if w), key=len, reverse=True)
         speaker = self._speaker or NullSpeaker()
         if self._speaker is None:
             self._speaker = speaker
-        self.pipeline = Pipeline(cfg, engine=None, board=self.bridge.board,
+        asr = None
+        if voice == "mic":
+            # 麦克风模式必须有识别引擎（Pipeline.feed 在 engine 为空时什么也不做）；
+            # 与 tt_voice.cli mic 一样按 config.json 的 engine（默认 vosk）构造
+            try:
+                from tt_voice.engines import build_engine
+                asr = build_engine(cfg)
+            except Exception as exc:
+                raise RuntimeError(f"语音识别引擎构造失败：{exc}") from exc
+        self.pipeline = Pipeline(cfg, engine=asr, board=self.bridge.board,
                                  speaker=speaker, start_awake=(voice == "text"))
         self.pipeline.start()
+        if voice == "mic" and getattr(asr, "model", True) is None:
+            raise RuntimeError("语音识别模型未加载（检查 pingpong-voice-referee 的 models/ 与 config.json）")
         if voice == "text":
             self._worker = threading.Thread(target=self._text_worker, daemon=True)
         else:
@@ -90,7 +102,8 @@ class ScoreboardRuntime:
                 target=self._mic_worker, args=(cfg, input_device), daemon=True)
         self._worker.start()
         if not self.quiet:
-            print(f"[语音] 模式：{voice}" + ("" if voice != "text" else "（stdin 口令，唤醒词可同句）"))
+            print(f"[语音] 模式：{voice}" + ("" if voice != "text" else
+                  "（stdin 口令；可写「小裁判 撤销上一分」，也可只写口令）"))
 
     def _text_worker(self) -> None:
         for line in sys.stdin:
@@ -110,6 +123,22 @@ class ScoreboardRuntime:
                     self._queue.put(("pcm", block))
         except Exception as exc:
             self._queue.put(("error", str(exc)))
+
+    def _text_parts(self, text: str) -> List[str]:
+        """文本口令拆成"唤醒词 + 口令"两段依次送入。
+
+        语音仓库在聆听态下，整句能匹配唤醒词就当作"又喊了一次唤醒词"，不再解析口令，
+        所以「小裁判 撤销上一分」必须拆开送。只写口令时，若已退出聆听态，先补一次唤醒词。
+        """
+        text = text.strip()
+        for wake in getattr(self, "_wake_words", []):
+            if text.startswith(wake):
+                rest = text[len(wake):].strip(" ，,。.、")
+                return [wake, rest] if rest else [wake]
+        from tt_voice.app import STATE_IDLE
+        if self._wake_words and self.pipeline is not None and self.pipeline.state == STATE_IDLE:
+            return [self._wake_words[0], text]
+        return [text]
 
     @staticmethod
     def _print_results(results) -> None:
@@ -131,7 +160,8 @@ class ScoreboardRuntime:
                 if self.pipeline is None:
                     continue
                 if kind == "text":
-                    out += self.pipeline.push_text(value, now=now)
+                    for part in self._text_parts(value):
+                        out += self.pipeline.push_text(part, now=now)
                 elif kind == "pcm":
                     out += self.pipeline.feed(value, now=now)
         if out and not self.quiet:
@@ -227,17 +257,36 @@ def _run_video(runtime: ScoreboardRuntime, decisions: List[Dict[str, Any]],
     return last_t
 
 
+def _linger(runtime: ScoreboardRuntime, last_t: float, linger_s: float, speed: float) -> float:
+    """回放结束后让 UI / 语音再运行 linger_s 秒（墙钟），方便现场说口令、录屏收尾。"""
+    if linger_s <= 0:
+        return last_t
+    start = time.monotonic()
+    video_t = last_t
+    while True:
+        now = time.monotonic()
+        if now - start >= linger_s:
+            return video_t
+        video_t = last_t + (now - start) * speed
+        runtime.tick(video_t)
+        runtime.poll(now)
+        time.sleep(0.02)
+
+
 def run_scoreboard(run_dir: str, *, video: Optional[str] = None, speed: float = 1.0,
                    max_frames: Optional[int] = None, ui: bool = False,
                    ui_port: int = 8765, ui_window: str = "1024x600",
                    open_browser: bool = False, voice: str = "none",
                    say: bool = True, dead_ball_mode: str = "pending",
                    pending_timeout_s: float = 5.0, input_device: Optional[int] = None,
-                   out_dir: Optional[str] = None, quiet: bool = False) -> Dict[str, Any]:
+                   out_dir: Optional[str] = None, quiet: bool = False,
+                   linger_s: float = 0.0) -> Dict[str, Any]:
     if speed <= 0:
         raise ValueError("speed 必须 > 0")
     if pending_timeout_s < 0:
         raise ValueError("pending_timeout_s 必须 >= 0")
+    if linger_s < 0:
+        raise ValueError("linger_s 必须 >= 0")
     decisions_path = os.path.join(run_dir, "decisions.jsonl")
     if not os.path.isfile(decisions_path):
         raise FileNotFoundError(f"找不到判罚文件：{decisions_path}")
@@ -251,6 +300,7 @@ def run_scoreboard(run_dir: str, *, video: Optional[str] = None, speed: float = 
     try:
         last_t = (_run_video(runtime, decisions, video, speed, max_frames)
                   if video else _run_clock(runtime, decisions, speed))
+        last_t = _linger(runtime, last_t, linger_s, speed)
         runtime.tick(last_t + pending_timeout_s)
     finally:
         runtime.close()
@@ -277,6 +327,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dead-ball-mode", choices=["pending", "ignore"], default="pending")
     ap.add_argument("--pending-timeout-s", type=float, default=5.0)
     ap.add_argument("--input-device", type=int, default=None)
+    ap.add_argument("--linger-s", type=float, default=0.0,
+                    help="回放结束后 UI/语音继续运行的秒数（现场说口令、录屏用）")
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--quiet", action="store_true")
     return ap
@@ -289,7 +341,8 @@ def main(argv=None) -> int:
         ui=a.ui, ui_port=a.ui_port, ui_window=a.ui_window,
         open_browser=a.open_browser, voice=a.voice, say=a.say,
         dead_ball_mode=a.dead_ball_mode, pending_timeout_s=a.pending_timeout_s,
-        input_device=a.input_device, out_dir=a.out_dir, quiet=a.quiet)
+        input_device=a.input_device, out_dir=a.out_dir, quiet=a.quiet,
+        linger_s=a.linger_s)
     return 0
 
 

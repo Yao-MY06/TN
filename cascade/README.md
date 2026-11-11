@@ -123,7 +123,7 @@ run_cascade / run_realtime decisions
 
 `run_scoreboard.py` 的主要开关：`--ui` / `--ui-port` / `--ui-window` / `--open-browser`，
 `--voice none|text|mic`，`--say` / `--no-say`，`--dead-ball-mode pending|ignore`，
-`--pending-timeout-s`（秒），`--speed`，`--max-frames`。`run_realtime.py` 需先加 `--scoreboard`，
+`--pending-timeout-s`（秒），`--speed`，`--max-frames`，`--linger-s`（回放结束后 UI/语音继续运行的秒数，现场说口令、录屏收尾用）。`run_realtime.py` 需先加 `--scoreboard`，
 再使用同一组 UI/语音开关。
 
 ```powershell
@@ -142,7 +142,7 @@ python -m cascade.run_scoreboard `
 每次视觉加分听到“右方得分，左方0比1/2右方”。结束时终端打印物理累计 `A:0 B:2`，
 并写 `scoreboard_log.jsonl`、`scoreboard_final.json`。
 
-文本模式（stdin 与视觉在同一个主循环处理，唤醒词可以和口令同句）：
+文本模式（stdin 与视觉在同一个主循环处理）：
 
 ```powershell
 python -m cascade.run_scoreboard `
@@ -155,7 +155,9 @@ python -m cascade.run_scoreboard `
 ```
 
 预期：视觉到 0:2 后，在终端输入 `小裁判 撤销上一分`，UI 回到 0:1 并播报“已撤销”；
-再输入 `小裁判 左方加一分`，UI 变为 1:1。文本模式会跳过单独的唤醒阶段，但口令里带“ 小裁判 ”也能匹配。
+再输入 `小裁判 左方加一分`，UI 变为 1:1。
+文本模式会把行首的唤醒词拆出来，先送唤醒词、再送口令（语音仓库在聆听态下整句能匹配唤醒词时只回“在”，不解析口令）；
+只写口令也可以，聆听窗口已结束时会自动补一次唤醒词。
 
 麦克风模式（先确认设备编号；没有默认输入设备时用 `python -m tt_voice.cli devices`）：
 
@@ -171,6 +173,9 @@ python -m cascade.run_scoreboard `
 
 预期：先说“小裁判”，听到“在”；再说“撤销上一分”或“左方加一分”，UI 与播报同步更新。
 如果 `0` 不是你的麦克风编号，替换成 `devices` 输出中的编号。
+麦克风模式按语音仓库 `config.json` 的 `engine`（默认 vosk）构造识别引擎，需要先下载模型（`python tools\download_model.py`）。
+test_2 只有 30 s，0:2 出现在约 24 s；现场说口令建议加 `--speed 0.5` 或 `--linger-s 30`。
+建议先单独说“小裁判”，听到“在”再说口令。
 
 `run_realtime.py` 同样支持这些开关，只需加 `--scoreboard`：
 
@@ -191,7 +196,10 @@ python -m cascade.run_realtime --video D:\OpenTTGames\test\videos\test_2.mp4 `
   `pingpong-voice-referee`，不会同时加载另一份 `tt_referee`。
 - `DEAD_BALL` 的待确认侧别是 `UNKNOWN`。只说“确认这一分”不会猜赢家，而是保留待确认并提示补说“左方加一分/右方加一分”；直接说方向会补上该分。
 - Windows 播报走 SAPI；Linux 只输出控制台文本。麦克风需要 `sounddevice`，语音文本需要 `pypinyin` 等语音仓库依赖。
-- 本机无 `pypinyin`，所以 `push_text` 测试自动跳过；回放、UI、桥接和计分测试不依赖该包。
+- 本机无 `pypinyin`，所以语音文本 / 麦克风相关测试自动跳过；回放、UI、桥接和计分测试不依赖该包。
+- 同组仓库按 `cascade/_paths.py` 的顺序查找：环境变量 `PPQ_ROOT`（或 TN 的上一级）→ TN 根目录 → `TN/third_party`。
+  原机的布局是 TN 仓库直接克隆在 `ppq/`，语音仓库放在 `ppq/pingpong-voice-referee` 即可，不需要额外建目录联接。
+- `gd*` 状态机需要国栋仓库 `main` 73ea183 或更新（门控版）；`fusion/three-way` 自带的 `third_party` 快照是旧版，加载时会报“版本过旧”，测试自动跳过。
 
 ## 画视频（事后渲染）
 
