@@ -99,6 +99,7 @@ class TestStateMachineEventIds(unittest.TestCase):
                 obs, timestamp, set())
         return ref, seen
 
+    @unittest.skipUnless(HAS_GD, GD_REASON or "")
     def test_duplicate_out_ids_are_unique_only_inside_state_machine(self):
         ref, seen = self._feed_duplicate_out("gd")
         self.assertEqual(seen, ["out_00001", "out_00001~2"])
