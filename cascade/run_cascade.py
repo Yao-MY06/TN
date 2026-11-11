@@ -223,6 +223,7 @@ class CascadeCore:
             "results": self.results, "clips": self.scheduler.submitted,
             "reviewer": self.reviewer, "referee": self.referee,
         })
+        review_queue.extend(self.referee.racket_review_queue())
         for adj in self.referee.net_adjudications:
             if adj["decision"] == "reverse":
                 category, reason = "net_reversal", "net_reversal"
@@ -288,6 +289,7 @@ class CascadeCore:
                                        for ev, _ in (self.referee.source.suppressed_serve
                                                      if self.referee.source else [])],
             "params": asdict(self.params), "commit": asdict(self.commit_cfg),
+            "racket_evidence": self.referee.racket_summary(),
             "merge": self.merge, "max_clip_s": self.max_clip_s,
             "pre_ctx": self.pre_ctx, "post_ctx": self.post_ctx,
             "primary": self.primary,
@@ -552,6 +554,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--no-out", action="store_true")
     ap.add_argument("--state-machine", default="tn", choices=CHOICES,
                     help="计分状态机：tn=TN 共用版（默认）；gd/gd-traj=国栋门控版；gd-nr=仅归因；ttnet11-*")
+    ap.add_argument("--racket", default=None, help="球拍 racket.v1 缓存 JSONL")
+    ap.add_argument("--racket-hit-hold", choices=["off", "shadow", "drop"], default="off",
+                    help="球拍证据：off=默认不变；shadow=只打标签；drop=撤销 FAR")
+    ap.add_argument("--racket-static-filter", action="store_true")
     ap.add_argument("--out-dir", default=None)
     ap.add_argument("--quiet", action="store_true")
     add_ttnet_args(ap)
@@ -566,7 +572,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                             dropout_trigger=not a.no_dropout_trigger,
                             dropout_min_s=a.dropout_min_s)
     commit = CommitConfig(jitter_merge=not a.no_jitter_merge, use_out=not a.no_out,
-                          state_machine=a.state_machine)
+                          state_machine=a.state_machine, racket_cache=a.racket,
+                          racket_hit_hold=a.racket_hit_hold,
+                          racket_static_filter=a.racket_static_filter)
     res = run(a.jsonl, a.preset, a.quad, a.reviewer, a.oracle_events, a.yolo, params, commit,
               a.review_latency_s, a.review_deadline_s,
               merge=not a.no_merge, max_clip_s=a.max_clip_s,

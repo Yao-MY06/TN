@@ -14,6 +14,7 @@ MARKUP = os.path.join(TN_ROOT, "_data", "gt", "extended_openttgames", "inferred"
                       "test_2_events_markup_inferred.json")
 EXTENDED = os.path.join(TN_ROOT, "_data", "gt", "extended_openttgames", "game_data",
                         "test", "test_2.json")
+RACKET = os.path.join(TN_ROOT, "_data", "racket", "test_2.jsonl")
 
 
 def _stats(tp, fp, fn, points_correct=1, points_total=1, clips=10,
@@ -99,6 +100,23 @@ class TestRunBatchTest2(unittest.TestCase):
             with open(result["summary_md"], encoding="utf-8") as f:
                 md = f.read()
             self.assertIn("状态机: `gd`", md)
+
+    def test_racket_manifest_fields_reach_commit_and_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = os.path.join(tmp, "manifest.json")
+            with open(manifest, "w", encoding="utf-8") as f:
+                json.dump({"videos": [{
+                    "name": "test_2", "split": "tuning", "preset": "test2",
+                    "tracknet": OBS, "events_markup": MARKUP, "extended": EXTENDED,
+                    "racket": RACKET, "racket_hit_hold": "shadow",
+                }]}, f)
+            out = os.path.join(tmp, "out")
+            run_batch(manifest, out)
+            with open(os.path.join(out, "test_2_rule", "summary.json"), encoding="utf-8") as f:
+                summary = json.load(f)
+            self.assertEqual(summary["commit"]["racket_cache"], RACKET)
+            self.assertEqual(summary["commit"]["racket_hit_hold"], "shadow")
+            self.assertEqual(summary["racket_evidence"]["mode"], "shadow")
 
     def test_ttnet_path_and_outside_column(self):
         with open(MARKUP, encoding="utf-8") as f:

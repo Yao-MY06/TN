@@ -84,6 +84,79 @@ python -m cascade.run_realtime --video <test_2.mp4> --pace realtime \
 test_2 全回放（sleep=0）与 `run_cascade` 的 proposals / clips / `events.jsonl`、判罚文本和比分逐项一致；
 规则复核落台 F1 0.903，TTNet 复核 0.871。
 
+## 球拍证据：RACKET_HIT 的 shadow / drop（默认关）
+
+球拍缓存来自 `_data/racket/test_N.jsonl`，按 `racket.v1` 读取，不依赖球拍仓库运行时。
+默认 `--racket-hit-hold off` 时完全不加载缓存，`events.jsonl` / `decisions.jsonl` 与旧行为逐字节一致。
+
+### 固定参数
+
+参数只在 test_2 上扫，选定后固定：
+
+- Δt = 0.15 s
+- 窗口中心相对 RACKET_HIT 前移 0.05 s
+- 球拍置信度阈值 c = 0.50
+- 球拍到球的距离按球拍框对角线归一化；NEAR 阈值 3.0
+- 真击球匹配沿用 `eval_extended` 的 [-5, +25] 帧，并要求侧别相同
+
+分类规则：
+
+- `NEAR`：窗口内有同侧球拍，且框到球的距离 ≤ 阈值
+- `FAR`：窗口内有同侧球拍，但距离 > 阈值
+- `NONE`：窗口内没有同侧球拍
+- `OTHER_SIDE`：只看到另一侧球拍
+
+`shadow` 只给 RACKET_HIT 加 `racket_evidence` 标签，并把诊断项追加到 `review_queue.jsonl`；`drop` 只撤销 `FAR`。
+没有同侧候选、缓存缺失或该帧未处理时立即按 `NONE` 放行；有同侧候选时最多扣留到窗口结束（0.10 s）。
+`summary.json` 的 `racket_evidence` 记录四类计数、held/dropped/released 和额外延迟。
+
+### 跑证据分析和模式对比
+
+```bash
+python -m cascade.racket_evidence \
+    --manifest cascade/batch_manifest.json \
+    --runs-root outputs/cascade_batch_racket/off \
+    --racket-dir _data/racket \
+    --out-dir outputs/racket_eval
+
+python -m cascade.racket_compare \
+    --base outputs/cascade_batch_racket/off \
+    --compare outputs/cascade_batch_racket/shadow outputs/cascade_batch_racket/drop \
+    --manifest cascade/batch_manifest.json \
+    --out-dir outputs/cascade_batch_racket
+```
+
+清单项新增：
+
+```json
+"racket": "../_data/racket/test_2.jsonl",
+"racket_hit_hold": "shadow",
+"racket_static_filter": false
+```
+
+`racket_hit_hold` 可取 `off` / `shadow` / `drop`。静止过滤是可选项，开启后会过滤位置和框大小长期不变的目标；
+test_7 的 26,010 条 visible UNKNOWN 检出中过滤掉 14,879 条，A/B 侧证据不变。
+
+### 7 段结果
+
+| 模式 | 复核 | test_2 判对 | 留出含 test_4 判对 | 留出不含 test_4 判对 | 含 test_4 多判/死球 | 不含 test_4 多判/死球 | 击球 P/R（含 test_4） |
+|---|---|---:|---:|---:|---:|---:|---:|
+| off | rule | 2/2 | 34/56 | 21/35 | 28/35 | 15/22 | 0.606/0.881 |
+| shadow | rule | 2/2 | 34/56 | 21/35 | 28/35 | 15/22 | 0.606/0.881 |
+| drop | rule | 2/2 | 34/56 | 22/35 | 41/29 | 35/19 | 0.651/0.722 |
+| off | ttnet | 2/2 | 34/56 | 23/35 | 19/32 | 11/23 | 0.606/0.881 |
+| shadow | ttnet | 2/2 | 34/56 | 23/35 | 19/32 | 11/23 | 0.606/0.881 |
+| drop | ttnet | 2/2 | 32/56 | 22/35 | 39/24 | 33/18 | 0.651/0.722 |
+
+test_4 是球拍模型训练集，必须单独看；留出集合计同时给出含/不含 test_4。
+
+结论：
+
+- 球拍证据在 test_2 能分开大部分假击球：FAR 为 0 真 / 9 假，`drop` 把击球精确率从 0.725 提到 0.935，召回保持 1.000。
+- 但留出集不稳定：含 test_4 时 FAR 为 47 真 / 55 假，不含 test_4 时仍有 36 真 / 36 假。`drop` 把召回压到 0.722（含 test_4）和 0.744（不含），说明 FAR 不能可靠代表假击球。
+- 判分上没有收益：rule 含 test_4 判对数不变，不含 test_4 仅 +1；TTNet 含 test_4 -2，不含 test_4 -1。多判显著增加，死球减少。
+- `shadow` 与 off 的判分表完全一致，只增加标签和诊断清单。
+- 因此 `drop` 不值得默认开启，保持 `off`；`shadow` 可用于继续收集证据。
 ## 计分 UI 与语音
 
 三模型级联只负责产生 `decisions.jsonl`。级联状态机照常独立运行，不回写；语音仓库的 `ScoreEngine`
@@ -259,6 +332,8 @@ python -m cascade.run_cascade --jsonl _data/obs/tracknet/test_4.jsonl \
 | `review_queue.py` | 汇总 `uncertain` / `error` / `timeout` 片段，生成待人工确认清单 |
 | `run_batch.py` | 按清单批量跑 rule / ttnet，生成 `summary.md` / `summary.csv` 与 holdout 池化合计；支持 `--state-machine` |
 | `compare_sm.py` | 只读批量输出，比较多个状态机的判分、门因归因、门控计数与出界诊断 |
+| `racket_evidence.py` | 球拍证据 NEAR/FAR/NONE/OTHER_SIDE 分类、test_2 参数扫描与静止目标过滤 |
+| `racket_compare.py` | 对比 off/shadow/drop 的判分、击球精确率/召回和逐分改判 |
 | `render_video.py` | 事后把一次运行画成带 HUD 的视频（球位来源、复核区间状态、事件、比分、时间轴） |
 | `racket_cache.py` | 视频 → 逐帧球拍观测缓存（racket.v1，朗然的 `pingpong-racket-detector`，侧别按本机位网线 x 判定），原机用 |
 | `run_realtime.py` | 实时层入口：视频/空帧源、并行 YOLO/TrackNet/TTNet worker、有界队列与运行统计；可接计分牌 |
