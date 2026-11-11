@@ -22,6 +22,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from ._paths import SM_ROOT  # noqa: F401
 from .online_out import OnlineOutDetector
+from .racket_evidence import RacketEvidence
 
 import run_mixed as rm  # noqa: E402  (tt/run_mixed.py)
 from core.schemas import EventType, FrameObservation, RefereeEvent  # noqa: E402
@@ -70,6 +71,10 @@ class CommitConfig:
     # 网附近反向击球：扣住网带内、NET_TOUCH 后 0.15 s 内的 RACKET_HIT，
     # 用之后 0.3 s 的融合轨迹裁决；默认关闭。
     net_hit_hold: bool = False
+    # 球拍证据：off=默认不变；shadow=只打标签；drop=撤销 FAR 击球。
+    racket_cache: Optional[str] = None
+    racket_hit_hold: str = "off"
+    racket_static_filter: bool = False
     # 计分状态机：tn（默认，与 run_mixed 一致）/ gd* / ttnet11-*，见 state_machines.py
     state_machine: str = "tn"
 
@@ -125,11 +130,30 @@ class StreamingReferee:
         self._held_batch: Optional[Dict[str, Any]] = None
         self.net_adjudications: List[Dict[str, Any]] = []
 
+        # 球拍证据：窗口结束前扣住 RACKET_HIT，shadow 只贴标签，drop 撤销 FAR。
+        if self.cfg.racket_hit_hold not in ("off", "shadow", "drop"):
+            raise ValueError("racket_hit_hold 只能是 off/shadow/drop")
+        self.racket_provider = (RacketEvidence.from_cache(
+            self.cfg.racket_cache, static_filter=self.cfg.racket_static_filter)
+            if self.cfg.racket_hit_hold != "off" else None)
+        self._racket_held: Optional[Dict[str, Any]] = None
+        self.racket_events: List[Dict[str, Any]] = []
+        self.racket_class_counts = {k: 0 for k in ("NEAR", "FAR", "NONE", "OTHER_SIDE")}
+        self.racket_held_count = 0
+        self.racket_dropped = 0
+        self.racket_released = 0
+        self._racket_delays: List[float] = []
+        self._ball_by_frame: Dict[int, Tuple[float, float]] = {}
+        self._ball_history: Deque[Tuple[float, int]] = deque()
+
     def held_hit_watermark(self) -> float:
-        """未裁决的网带击球必须压住虚拟水位线。"""
-        if self._held_batch is None:
-            return float("inf")
-        return float(self._held_batch["events"][0].timestamp_s)
+        """未裁决的网带/球拍击球必须压住虚拟水位线。"""
+        marks = []
+        if self._held_batch is not None:
+            marks.append(float(self._held_batch["events"][0].timestamp_s))
+        if self._racket_held is not None:
+            marks.append(float(self._racket_held["events"][0].timestamp_s))
+        return min(marks) if marks else float("inf")
 
     # ------------------------------------------------------------------ 真实侧
     def push_frame(self, raw: FrameObservation) -> None:
@@ -138,6 +162,13 @@ class StreamingReferee:
         self.n_lowconf += n
         tob = masked[0]
         self._vqueue.append((tob, raw.timestamp_s))
+        if raw.ball.visible and raw.ball.center_px is not None:
+            fid = int(raw.frame_id)
+            self._ball_by_frame[fid] = tuple(float(v) for v in raw.ball.center_px[:2])
+            self._ball_history.append((float(raw.timestamp_s), fid))
+            while self._ball_history and self._ball_history[0][0] < float(raw.timestamp_s) - 1.0:
+                _, old = self._ball_history.popleft()
+                self._ball_by_frame.pop(old, None)
         self._update_dropouts(tob)
         if self.out_det is not None:
             self.out_det.push(raw)
@@ -169,6 +200,9 @@ class StreamingReferee:
     # ------------------------------------------------------------------ 推进
     def advance(self, bounce_unknown_before_t: float) -> None:
         """``bounce_unknown_before_t``：尚未确认的落台，其时间戳不会早于这个值。"""
+        if self._racket_held is not None:
+            if not self._try_resolve_racket_held():
+                return
         if self._held_batch is not None:
             if not self._try_resolve_held():
                 return
@@ -193,6 +227,8 @@ class StreamingReferee:
                 break
 
     def finish(self) -> None:
+        if self._racket_held is not None:
+            self._try_resolve_racket_held(force=True)
         if self._held_batch is not None:
             self._try_resolve_held(force=True)
         if self.out_det is not None:
@@ -294,6 +330,24 @@ class StreamingReferee:
     def _process_event_batch(self, events: List[RefereeEvent], obs: FrameObservation,
                              t: float, injected_ids: set[int]) -> None:
         for i, ev in enumerate(events):
+            evidence = None
+            if self.racket_provider is not None and ev.type == EventType.RACKET_HIT.value:
+                same_side = self.racket_provider.has_same_side_candidates(ev.side, ev.timestamp_s)
+                decide_at = self.racket_provider.decision_time(ev.timestamp_s)
+                if same_side and self._now_t is not None and self._now_t + _EPS < decide_at:
+                    self._racket_held = {
+                        "events": list(events[i:]), "obs": obs, "t": t,
+                        "injected_ids": set(injected_ids),
+                    }
+                    self.racket_held_count += 1
+                    self._try_resolve_racket_held()
+                    return
+                evidence = self._classify_racket(ev)
+                if self.cfg.racket_hit_hold == "drop" and evidence["label"] == "FAR":
+                    self._record_racket(ev, evidence, "dropped")
+                    self.racket_dropped += 1
+                    continue
+                self._record_racket(ev, evidence, "emitted")
             if self._is_hold_candidate(ev):
                 self._held_batch = {
                     "events": list(events[i:]), "obs": obs, "t": t,
@@ -301,10 +355,10 @@ class StreamingReferee:
                 }
                 self._try_resolve_held()
                 return
-            self._emit_event(ev, obs, t, injected_ids)
+            self._emit_event(ev, obs, t, injected_ids, racket_evidence=evidence)
 
     def _emit_event(self, ev: RefereeEvent, obs: FrameObservation, t: float,
-                    injected_ids: set[int]) -> None:
+                    injected_ids: set[int], racket_evidence: Optional[Dict[str, Any]] = None) -> None:
         cfg, sm = self.cfg, self.sm
         if id(ev) not in injected_ids:
             ev.sources = [obs.source]
@@ -312,14 +366,17 @@ class StreamingReferee:
         pos = None
         if ev.position_px is not None:
             pos = (round(float(ev.position_px[0]), 1), round(float(ev.position_px[1]), 1))
-        self.dumped_events.append({
+        dumped = {
             "event_id": ev.event_id,
             "timestamp_s": round(float(ev.timestamp_s), 6),
             "type": ev.type,
             "side": ev.side,
             "position_px": list(pos) if pos else None,
             "confidence": ev.confidence,
-        })
+        }
+        if racket_evidence is not None:
+            dumped["racket_evidence"] = dict(racket_evidence)
+        self.dumped_events.append(dumped)
         self.event_sources[ev.event_id] = list(ev.sources)
         self.log_lines.append(
             f"  [帧 {obs.frame_id:04d} | {t:6.3f}s] 事件: {ev.type:<11} 半台: {ev.side:<7} ID: {ev.event_id}")
@@ -341,6 +398,94 @@ class StreamingReferee:
         self.sm_event_id_renames += 1
         return replace(ev, event_id=candidate)
 
+
+    def _ball_at_frame(self, frame_id: int) -> Optional[Tuple[float, float]]:
+        for delta in range(0, 4):
+            for fid in ((frame_id,) if delta == 0 else (frame_id - delta, frame_id + delta)):
+                if fid in self._ball_by_frame:
+                    return self._ball_by_frame[fid]
+        return None
+
+    def _classify_racket(self, ev: RefereeEvent) -> Dict[str, Any]:
+        return self.racket_provider.classify(
+            ev.side, ev.timestamp_s, ev.position_px, self._ball_at_frame)
+
+    def _record_racket(self, ev: RefereeEvent, evidence: Dict[str, Any], action: str,
+                       release_delay_s: float = 0.0) -> None:
+        self.racket_class_counts[evidence["label"]] += 1
+        self.racket_events.append({
+            "event_id": ev.event_id, "timestamp_s": round(float(ev.timestamp_s), 6),
+            "side": ev.side, "action": action, "label": evidence["label"],
+            "distance_ratio": evidence.get("distance_ratio"),
+            "racket_frame_id": evidence.get("racket_frame_id"),
+            "racket_confidence": evidence.get("racket_confidence"),
+            "window_s": evidence.get("window_s"),
+            "decision_time_s": evidence.get("decision_time_s"),
+            "release_delay_s": round(max(0.0, float(release_delay_s)), 6),
+            "missing_cache": bool(evidence.get("missing_cache")),
+        })
+
+    def _try_resolve_racket_held(self, force: bool = False) -> bool:
+        held = self._racket_held
+        if held is None:
+            return True
+        hit = held["events"][0]
+        decide_at = self.racket_provider.decision_time(hit.timestamp_s)
+        if not force and (self._now_t is None or self._now_t + _EPS < decide_at):
+            return False
+        evidence = self._classify_racket(hit)
+        delay = max(0.0, float(self._now_t or hit.timestamp_s) - float(hit.timestamp_s))
+        self._racket_delays.append(delay)
+        self._racket_held = None
+        if self.cfg.racket_hit_hold == "drop" and evidence["label"] == "FAR":
+            self._record_racket(hit, evidence, "dropped", delay)
+            self.racket_dropped += 1
+        else:
+            self._record_racket(hit, evidence, "emitted", delay)
+            self.racket_released += 1
+            self._emit_event(hit, held["obs"], held["t"], held["injected_ids"],
+                             racket_evidence=evidence)
+        rest = list(held["events"][1:])
+        if rest:
+            self._process_event_batch(rest, held["obs"], held["t"], held["injected_ids"])
+        return True
+
+    def racket_summary(self) -> Optional[Dict[str, Any]]:
+        if self.cfg.racket_hit_hold == "off":
+            return None
+        delays = sorted(self._racket_delays)
+        return {
+            "enabled": True, "mode": self.cfg.racket_hit_hold,
+            "cache": self.cfg.racket_cache,
+            "provider": self.racket_provider.describe() if self.racket_provider else None,
+            "classes": dict(self.racket_class_counts),
+            "held": self.racket_held_count, "dropped": self.racket_dropped,
+            "released": self.racket_released,
+            "extra_delay_s": {
+                "p50": delays[len(delays) // 2] if delays else 0.0,
+                "max": max(delays) if delays else 0.0,
+            },
+            "events": list(self.racket_events),
+        }
+
+    def racket_review_queue(self) -> List[Dict[str, Any]]:
+        if self.cfg.racket_hit_hold == "off":
+            return []
+        category = "racket_shadow" if self.cfg.racket_hit_hold == "shadow" else "racket_drop"
+        out = []
+        for item in self.racket_events:
+            t = float(item["timestamp_s"])
+            out.append({
+                "clip_id": f"racket:{item['event_id']}", "category": category,
+                "proposal_ids": [], "status": "diagnostic",
+                "reason": f"racket_{item['label'].lower()}",
+                "reason_codes": [f"racket_{item['label'].lower()}"],
+                "start_timestamp_s": round(t - 0.2, 6), "end_timestamp_s": round(t + 0.2, 6),
+                "start_frame_id": None, "end_frame_id": None, "missing_context": False,
+                "hump_peak": None, "humps": [], "nearby_decisions": [],
+                "reviewer": "racket", "racket_evidence": dict(item),
+            })
+        return out
     def _try_resolve_held(self, force: bool = False) -> bool:
         """返回是否已裁决。帧不够且非收尾时继续扣住。"""
         held = self._held_batch

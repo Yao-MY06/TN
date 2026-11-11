@@ -122,6 +122,7 @@ def _run_entry(entry: Dict[str, Any], manifest_dir: str, out_dir: str,
     tracknet = _resolve(manifest_dir, entry.get("tracknet"))
     yolo = _resolve(manifest_dir, entry.get("yolo"))
     ttnet_cache = _resolve(manifest_dir, entry.get("ttnet_cache"))
+    racket = _resolve(manifest_dir, entry.get("racket"))
     markup = _resolve(manifest_dir, entry.get("events_markup"))
     extended = _resolve(manifest_dir, entry.get("extended"))
     fps = float(entry.get("fps", 120.0))
@@ -135,6 +136,9 @@ def _run_entry(entry: Dict[str, Any], manifest_dir: str, out_dir: str,
     sm = str(entry.get("state_machine") or state_machine)
     if sm not in CHOICES:
         raise ValueError(f"{name}: 未知状态机 {sm!r}，可选 {CHOICES}")
+    racket_mode = str(entry.get("racket_hit_hold") or "off")
+    if racket_mode not in ("off", "shadow", "drop"):
+        raise ValueError(f"{name}: 未知 racket_hit_hold {racket_mode!r}")
 
     if not tracknet or not os.path.isfile(tracknet):
         raise FileNotFoundError(f"{name}: TrackNet 观测不存在: {tracknet}")
@@ -153,6 +157,7 @@ def _run_entry(entry: Dict[str, Any], manifest_dir: str, out_dir: str,
         "video": name, "split": split, "frames": None,
         "proposal_recall": None, "coverage": None, "ttnet_window_ratio": None,
         "rule": None, "ttnet": None, "notes": [], "state_machine": sm,
+        "racket_hit_hold": racket_mode,
     }
     if not ttnet_cache:
         row["notes"].append("缺 TTNet 缓存，未跑 ttnet 组")
@@ -172,7 +177,9 @@ def _run_entry(entry: Dict[str, Any], manifest_dir: str, out_dir: str,
         res = run(
             tracknet, preset=preset, quad=quad, reviewer=reviewer,
             yolo_jsonl=yolo, review_latency_s=latency,
-            commit=CommitConfig(state_machine=sm),
+            commit=CommitConfig(state_machine=sm, racket_cache=racket,
+                                     racket_hit_hold=racket_mode,
+                                     racket_static_filter=bool(entry.get("racket_static_filter", False))),
             review_deadline_s=deadline,
             pre_ctx=(8 - int(entry.get("ttnet_k", DEFAULT_K))) if reviewer == "ttnet" else 0,
             post_ctx=int(entry.get("ttnet_k", DEFAULT_K)) if reviewer == "ttnet" else 0,
