@@ -6,6 +6,9 @@
 
 侧别：球拍中心相对**本机位的网线 x**（来自 TN 的球台标定，不用球拍仓库默认的画面正中）判 A/B，
 压线 ±2% 画面宽度判 UNKNOWN。A = 画面左半台，与 TN 的物理侧一致。
+多类别权重（如 v11：racket_A / racket_B / racket_unknown）的适配器会优先用类别名定侧别，
+不回落到网线；缓存写出前一律按网线重算 ``side``，模型自己给的侧别另存为 ``model_side``。
+已有缓存可以用 ``--reside`` 离线重算，不必重跑模型。
 
     python -m cascade.racket_cache --video <test_2.mp4> --preset test2 --out _data/racket/test_2.jsonl
 
@@ -44,6 +47,52 @@ def net_x_for(preset: str, quad: Optional[str]) -> float:
     from .run_realtime import _clip_geometry
     _, calib = _clip_geometry(preset, quad)
     return float(calib.net_x)
+
+
+def geometric_side(record: Dict[str, Any], net_x: float, dead_zone_ratio: float = 0.02) -> str:
+    """按网线 x 判侧别（与球拍仓库 side_from_x 同一规则：压线 ±dead_zone 判 UNKNOWN）。"""
+    center = record.get("center_px")
+    width = (record.get("image_size") or [0, 0])[0]
+    if not center or not width:
+        return record.get("side") or "UNKNOWN"
+    cx = float(center[0])
+    if abs(cx - float(net_x)) <= float(width) * dead_zone_ratio:
+        return "UNKNOWN"
+    return "A" if cx < float(net_x) else "B"
+
+
+def apply_geometric_side(record: Dict[str, Any], net_x: float,
+                         dead_zone_ratio: float = 0.02) -> Dict[str, Any]:
+    out = dict(record)
+    out.setdefault("model_side", record.get("side"))
+    out["side"] = geometric_side(record, net_x, dead_zone_ratio)
+    return out
+
+
+def reside_file(src: str, dst: str, net_x: float, dead_zone_ratio: float = 0.02) -> Dict[str, Any]:
+    """已有缓存按网线重算侧别，写到 dst；返回改动统计。"""
+    n = changed = 0
+    os.makedirs(os.path.dirname(os.path.abspath(dst)) or ".", exist_ok=True)
+    with open(src, encoding="utf-8") as fin, open(dst, "w", encoding="utf-8") as fout:
+        for line in fin:
+            if not line.strip():
+                continue
+            d = json.loads(line)
+            new = apply_geometric_side(d, net_x, dead_zone_ratio)
+            n += 1
+            changed += int(new["side"] != d.get("side"))
+            fout.write(json.dumps(new, ensure_ascii=False) + "\n")
+    stats = {"src": os.path.abspath(src), "net_x": net_x, "records": n, "side_changed": changed}
+    meta_src = src + ".meta.json"
+    meta = {}
+    if os.path.isfile(meta_src):
+        with open(meta_src, encoding="utf-8") as f:
+            meta = json.load(f)
+    meta["reside"] = stats
+    meta["net_x"] = net_x
+    with open(dst + ".meta.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    return stats
 
 
 def _sha256(path: str) -> str:
@@ -114,7 +163,8 @@ def run(video: str, out: str, *, preset: str = "test2", quad: Optional[str] = No
                     infer_ms.append((time.perf_counter() - t0) * 1000.0)
                     frames_processed += 1
                     for obs in observations:
-                        f.write(json.dumps(obs.to_dict(), ensure_ascii=False) + "\n")
+                        rec = apply_geometric_side(obs.to_dict(), net_x)
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                         n_obs += 1
                         n_visible += int(bool(obs.visible))
                     if not quiet and frames_processed % 1200 == 0:
@@ -159,7 +209,9 @@ def load_racket_obs(path: str, visible_only: bool = True) -> Dict[int, List[Dict
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="视频 → 逐帧球拍观测缓存（racket.v1 JSONL）")
-    ap.add_argument("--video", required=True)
+    ap.add_argument("--video", default=None)
+    ap.add_argument("--reside", default=None,
+                    help="不跑模型：把已有缓存按网线重算侧别，写到 --out（v11 等多类别权重的缓存用）")
     ap.add_argument("--out", required=True)
     ap.add_argument("--preset", default="test2")
     ap.add_argument("--quad", default=None)
@@ -172,6 +224,12 @@ def main(argv=None) -> int:
     ap.add_argument("--device", default="auto")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args(argv)
+    if a.reside:
+        stats = reside_file(a.reside, a.out, net_x_for(a.preset, a.quad))
+        print(json.dumps(stats, ensure_ascii=False))
+        return 0
+    if not a.video:
+        ap.error("需要 --video（或用 --reside 只重算侧别）")
     run(a.video, a.out, preset=a.preset, quad=a.quad, weights=a.weights, imgsz=a.imgsz,
         conf=a.conf, stride=a.stride, max_frames=a.max_frames, device=a.device, quiet=a.quiet)
     return 0

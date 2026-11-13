@@ -52,6 +52,29 @@ class TestRacketCache(unittest.TestCase):
             with open(out + ".meta.json", encoding="utf-8") as f:
                 self.assertEqual(json.load(f)["net_x"], 400.0)
 
+    def test_class_side_is_overridden_by_net_x(self):
+        """多类别权重按类别名给的侧别与网线矛盾时，以网线为准，模型侧别另存。"""
+        from cascade.racket_cache import apply_geometric_side, reside_file
+        rec = {"side": "A", "center_px": [500.0, 130.0], "image_size": [640, 360], "visible": True,
+               "frame_id": 0}
+        out = apply_geometric_side(rec, 400.0)
+        self.assertEqual(out["side"], "B")
+        self.assertEqual(out["model_side"], "A")
+        near = apply_geometric_side({**rec, "center_px": [405.0, 130.0]}, 400.0)
+        self.assertEqual(near["side"], "UNKNOWN")
+        lost = apply_geometric_side({"side": "A", "center_px": None, "image_size": [640, 360]}, 400.0)
+        self.assertEqual(lost["side"], "A")
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = os.path.join(tmp, "a.jsonl"), os.path.join(tmp, "b.jsonl")
+            with open(src, "w", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+                f.write(json.dumps({**rec, "center_px": [100.0, 130.0]}) + "\n")
+            stats = reside_file(src, dst, 400.0)
+            self.assertEqual(stats, {"src": os.path.abspath(src), "net_x": 400.0,
+                                     "records": 2, "side_changed": 1})
+            sides = [json.loads(x)["side"] for x in open(dst, encoding="utf-8")]
+            self.assertEqual(sides, ["B", "A"])
+
 
 if __name__ == "__main__":
     unittest.main()
