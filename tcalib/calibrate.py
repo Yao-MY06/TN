@@ -94,17 +94,15 @@ def compat_fields(corners: np.ndarray, cam: Optional[CameraModel], net: Dict, im
     return out
 
 
-def calibrate_frames(
-    frames: Dict[str, np.ndarray],
-    params: DetectParams = DetectParams(),
-    init_quad: Optional[np.ndarray] = None,
+def calibrate_results(
+    results: Dict[str, FrameResult],
+    image_size: Tuple[int, int],
 ) -> CalibResult:
-    """frames: 帧号 → BGR 图像（同一机位、同一分辨率）。init_quad 给定时走半自动。"""
-    ids = sorted(frames)
+    """对已经完成单帧检测的结果做多帧汇总；CLI 预检后复用，避免重复检测。"""
+    ids = sorted(results)
     if not ids:
         raise ValueError("no frames")
-    h, w = frames[ids[0]].shape[:2]
-    results = {k: detect_frame(frames[k], init_quad=init_quad, params=params, seed=i) for i, k in enumerate(ids)}
+    w, h = image_size
     corners, std, used = aggregate(results)
     reasons: List[str] = []
     if corners is None:
@@ -142,6 +140,21 @@ def calibrate_frames(
     res = CalibResult(corners, conf, reasons, std, len(ids), len(used), ids, used, results, cam, net)
     res.compat = compat_fields(corners, cam, net, (w, h))
     return res
+
+
+def calibrate_frames(
+    frames: Dict[str, np.ndarray],
+    params: DetectParams = DetectParams(),
+    init_quad: Optional[np.ndarray] = None,
+) -> CalibResult:
+    """frames: 帧号 → BGR 图像（同一机位、同一分辨率）。init_quad 给定时走半自动。"""
+    ids = sorted(frames)
+    if not ids:
+        raise ValueError("no frames")
+    h, w = frames[ids[0]].shape[:2]
+    results = {k: detect_frame(frames[k], init_quad=init_quad, params=params, seed=i)
+               for i, k in enumerate(ids)}
+    return calibrate_results(results, (w, h))
 
 
 def result_to_dict(res: CalibResult, name: str, method: str) -> Dict:
