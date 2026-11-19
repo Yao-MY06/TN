@@ -6,3 +6,7 @@ frames/
 out/
 # 发给原机的代码包
 dist/
+# 原机本地运行产物（不进 git）
+out_*/
+videos.txt
+*.zip
