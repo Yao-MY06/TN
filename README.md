@@ -22,44 +22,23 @@
    - `net_zone`：网顶再高 4 cm（一个球径）的投影 y 到网底（含网柱外延）的 y；
    - `roi_box`：台面外扩（两端 120 cm、前后 60 cm、高 120 cm）的长方体投影外接框，**仅建议值**。
 
-## 固定机位自动标定（推荐）
-
-开播前直接从视频抽帧，不需要先手工导出图片：
+## 直接从视频标定（推荐）
 
 ```bash
-python scripts/calibrate_video.py \
-    --video test_2.mp4 \
-    --name test_2 \
-    --out out/test_2
+# 开场标定（默认）：开头 10 秒内均匀取 24 帧
+python scripts/calibrate_video.py --video test_2.mp4 --name test_2 --out out/test_2
+# 离线验收：整段视频 2%～98% 均匀取 24 帧；另存第 1200 帧原图供核对真值（不参与标定）
+python scripts/calibrate_video.py --video test_2.mp4 --name test_2 --out out/test_2 --mode spread --save-frame 1200
+# 批量 + 验收 + 打包（原机用）
+python scripts/batch_videos.py --videos videos.txt --out-root out --mode spread --count 24 \
+    --save-frame test_2:1200 --truth ../TN/calib/table_quads.json --zip results.zip
 ```
 
-默认从视频开头 10 秒抽 24 个候选帧，逐帧预检后选最多 8 个检测成功的清晰帧做多帧汇总；
-最终帧数在 5～10 之间时最稳定。输出：
-
-- `out/test_2/result.json`：四角、球网、相机、置信度、国栋 `TableCalibration` 字段
-- `out/test_2/overlay.jpg`：四角/球网画回原图
-- `out/test_2/corners.png`：四角放大图
-- `out/test_2/frames.csv`：逐帧检测成功/失败和边的内点率
-- `--save-frames`：把最终参与汇总的帧一并存到 `out/test_2/frames/`
-
-自动失败时先用粗四角做半自动精修：
-
-```bash
-python scripts/calibrate_video.py --video test_2.mp4 --name test_2 --out out/test_2 \
-    --init-quad "540,516;1330,532;1484,656;352,631"
-```
-
-再失败时运行 `scripts/click_corners.py` 人工点四下。
-
-可选把结果直接合并进 TN 的 `calib/table_quads.json`：
-
-```bash
-python scripts/calibrate_video.py --video test_2.mp4 --name test_2 --out out/test_2 \
-    --tn-quads ../TN/calib/table_quads.json
-```
-
-常用参数：`--start-s`、`--window-s`（秒）、`--count`、`--candidate-factor`、`--min-sharpness`、
-`--no-prefilter`。默认值与合成视频冒烟测试一致：8 个有效帧、候选因子 3。
+- 抽到的**所有帧**都计入置信度（有效帧占比、抖动）；汇总时剔除检测失败和偏离大的帧。不按清晰度挑帧。
+- 定位后核对实际帧号，对不上的记在 `result.json` 的 `video.seek_mismatch`。
+- 每段输出：`result.json`、`frames.csv`、`overlay.jpg`、`corners.png`、`frames/*.png`（`--save-frame` 指定的帧）。
+- 自动失败：先加 `--init-quad "x,y;x,y;x,y;x,y"` 走半自动，再不行用 `scripts/click_corners.py` 人工点。
+- 结果只写到输出目录。`table_quads.json` 是验收用的人工真值，**不要把自动结果写回去**。
 
 ## 用法
 ```
@@ -69,7 +48,7 @@ python scripts/check_compat.py out/*/result.json  # 用国栋的 TableCalibratio
 python scripts/corner_crops.py --image frames/test_2/f001200.png --out out/test_2/corners.png \
     --result out/test_2/result.json --cand "manual=540,516;1330,532;1484,656;352,631"
 python scripts/click_corners.py --frames frames/test_2 --name test_2 --out out/test_2 --refine   # 兜底，需显示器
-python -m unittest discover -s tests              # 合成图 + 视频抽帧回归测试
+python -m unittest discover -s tests              # 合成图 + 视频入口回归测试
 ```
 只依赖 numpy、opencv-python。
 
@@ -84,7 +63,7 @@ python -m unittest discover -s tests              # 合成图 + 视频抽帧回�
 test_2 的手标与同机位的 test_3、国栋 game2 在远左角差 17～21 px，先用原分辨率帧重新核定。
 
 ## 目录
-- tcalib/   算法（table / camera / detect / calibrate / video / viz / synth）
+- tcalib/   算法（table / camera / detect / calibrate / video / report / viz / synth）
 - scripts/  命令行
 - tests/    合成图测试
 - frames/   抽出的原图帧（不进 git）

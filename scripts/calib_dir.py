@@ -10,13 +10,12 @@
   <out>/result.json     主结果（四角、网、置信度、相机、TableCalibration 字段）
   <out>/overlay.jpg     画回原图（取参与汇总的中间一帧）
   <out>/frames.csv      逐帧检测结果
+  <out>/corners.png     四个角的放大图
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
-import json
 import os
 import sys
 import time
@@ -27,8 +26,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from tcalib.calibrate import calibrate_frames, result_to_dict  # noqa: E402
-from tcalib.table import CORNER_NAMES  # noqa: E402
-from tcalib.viz import draw_overlay  # noqa: E402
+from tcalib.report import write_outputs  # noqa: E402
 
 IMG_EXT = (".jpg", ".jpeg", ".png")
 
@@ -84,23 +82,7 @@ def main() -> None:
     d["runtime_s"] = round(dt, 2)
     d["image_size"] = [int(list(sizes)[0][1]), int(list(sizes)[0][0])]
 
-    os.makedirs(args.out, exist_ok=True)
-    with open(os.path.join(args.out, "result.json"), "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    with open(os.path.join(args.out, "frames.csv"), "w", newline="", encoding="utf-8") as f:
-        wr = csv.writer(f)
-        head = ["frame", "ok", "reason", "used"]
-        head += [f"{c}_{a}" for c in CORNER_NAMES for a in "xy"]
-        head += [f"{s}_inlier" for s in ("far", "right", "near", "left")]
-        wr.writerow(head)
-        for k in res.frame_ids:
-            r = res.frame_results[k]
-            row = [k, int(r.ok), r.reason, int(k in res.used_ids)]
-            row += [round(float(v), 2) for v in r.corners.reshape(-1)] if r.corners is not None else [""] * 8
-            row += [round(r.sides[s].inlier_ratio, 3) if s in r.sides else "" for s in ("far", "right", "near", "left")]
-            wr.writerow(row)
-    show_id = res.used_ids[len(res.used_ids) // 2] if res.used_ids else res.frame_ids[0]
-    cv2.imwrite(os.path.join(args.out, "overlay.jpg"), draw_overlay(frames[show_id], d), [cv2.IMWRITE_JPEG_QUALITY, 92])
+    write_outputs(args.out, d, res, frames)
 
     pts = d["points"]
     print(f"{args.name}: conf={d['confidence']} used {d['n_used']}/{d['n_frames']} {dt:.1f}s")
