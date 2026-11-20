@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .camera import CameraModel, net_geometry, solve_camera, suggest_roi
+from .camera import CameraModel, net_geometry, solve_camera
 from .curve import SideCurve, corners_from_curves, fit_curve, offset_fn, refit, side_frame
 from .detect import (
     DetectParams,
@@ -48,6 +48,12 @@ BOOTSTRAP_ROUNDS = 40
 FRAME_SIDE_MIN_FRAC = 0.3
 # 边的拱高上限（占弦长比例）：超过就当作拟合到了别的东西，退回直线
 MAX_SAGITTA_FRAC = 0.02
+# 检测裁剪框 roi_box 相对台面外接框的余量（占外接框宽度的比例），照国栋手填预设的习惯：
+# pingpong-smart-referee/core/geometry.py 的 game2、test4（与本项目同一套 OpenTTGames 机位）
+# 两组手填值折算下来左右各约 0.19~0.28、上方约 0.28~0.29、下方约 0.16~0.18。
+ROI_MARGIN_SIDE = 0.22
+ROI_MARGIN_TOP = 0.285
+ROI_MARGIN_BOTTOM = 0.17
 # 球擦网时球心最多高出网顶一个球径（4 cm），net_zone 的上沿按此外扩
 NET_ZONE_EXTRA_CM = 4.0
 
@@ -241,10 +247,10 @@ def compat_fields(corners: np.ndarray, cam: Optional[CameraModel], net: Dict, im
     (bx0, by0), (bx1, by1) = base
     t = 0.0 if abs(by1 - by0) < 1e-9 else (yc - by0) / (by1 - by0)
     out["net_x"] = int(round(bx0 + t * (bx1 - bx0)))
+    out["roi_box"] = roi_like_presets(corners, image_size)
     if cam is None:
         out["net_zone"] = None
-        out["roi_box"] = None
-        out["note"] = "相机解算失败：只给出网底线对应的 net_x，net_zone / roi_box 需手填"
+        out["note"] = "相机解算失败：只给出网底线对应的 net_x，net_zone 需手填"
         return out
     top = cam.project(
         np.array(
@@ -257,8 +263,21 @@ def compat_fields(corners: np.ndarray, cam: Optional[CameraModel], net: Dict, im
     y0 = int(np.floor(top[:, 1].min()))
     y1 = int(np.ceil(np.array(net["net_bottom_full"])[:, 1].max()))
     out["net_zone"] = [max(y0, 0), min(y1, h)]
-    out["roi_box"] = list(suggest_roi(cam, image_size))
     return out
+
+
+def roi_like_presets(corners: np.ndarray, image_size: Tuple[int, int]) -> List[int]:
+    """按国栋手填预设的习惯，由台面外接框外扩得到检测裁剪框 (y_min, y_max, x_min, x_max)。"""
+    w, h = image_size
+    x0, y0 = corners.min(axis=0)
+    x1, y1 = corners.max(axis=0)
+    tw = x1 - x0
+    return [
+        max(int(round(y0 - ROI_MARGIN_TOP * tw)), 0),
+        min(int(round(y1 + ROI_MARGIN_BOTTOM * tw)), h),
+        max(int(round(x0 - ROI_MARGIN_SIDE * tw)), 0),
+        min(int(round(x1 + ROI_MARGIN_SIDE * tw)), w),
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -192,27 +192,3 @@ def net_geometry(corners_px: Sequence[Sequence[float]], cam: Optional[CameraMode
     # 网面四边形：远底、近底、近顶、远顶
     out["net_polygon"] = [p[0].tolist(), p[1].tolist(), p[3].tolist(), p[2].tolist()]
     return out
-
-
-def suggest_roi(
-    cam: CameraModel,
-    image_size: Tuple[int, int],
-    margin_x_cm: float = 120.0,
-    margin_y_cm: float = 60.0,
-    height_cm: float = 120.0,
-) -> Tuple[int, int, int, int]:
-    """建议的检测裁剪框 (y_min, y_max, x_min, x_max)，字段顺序同国栋的 ROIBox。
-
-    取法：台面向两端各外扩 margin_x_cm、前后各外扩 margin_y_cm、
-    高度从 0 到 height_cm 的长方体，投影到图像取外接框再裁到画面内。
-    只是建议值，需要和现有手填 ROI 对比后再定。
-    """
-    w, h = image_size
-    xs = (-margin_x_cm, TABLE_LENGTH_CM + margin_x_cm)
-    ys = (-margin_y_cm, TABLE_WIDTH_CM + margin_y_cm)
-    zs = (0.0, height_cm)
-    box = np.array([[x, y, z] for x in xs for y in ys for z in zs])
-    p = cam.project(box)
-    x0, y0 = np.floor(p.min(axis=0)).astype(int)
-    x1, y1 = np.ceil(p.max(axis=0)).astype(int)
-    return (max(int(y0), 0), min(int(y1), h), max(int(x0), 0), min(int(x1), w))
