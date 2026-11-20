@@ -257,11 +257,13 @@ def compat_fields(corners: np.ndarray, cam: Optional[CameraModel], net: Dict, im
     above = cam.project(
         np.array(
             [
-                [NET_X_CM, -NET_POST_OUT_CM, NET_TOP_HEIGHT_CM + NET_ZONE_EXTRA_CM],
-                [NET_X_CM, TABLE_WIDTH_CM + NET_POST_OUT_CM, NET_TOP_HEIGHT_CM + NET_ZONE_EXTRA_CM],
+                [NET_X_CM, -NET_POST_OUT_CM, NET_HEIGHT_CM + NET_ZONE_EXTRA_CM],
+                [NET_X_CM, TABLE_WIDTH_CM + NET_POST_OUT_CM, NET_HEIGHT_CM + NET_ZONE_EXTRA_CM],
             ]
         )
     )
+    # 网顶线取的是白带中心（14.5cm）；net_zone 上沿 = 网顶（15.25cm）再高一个球径，
+    # 即在白带中心之上再加 (15.25 + 4 - 14.5) cm，按该处的投影比例换成像素。
     top_line = np.asarray(net["net_top_line"], dtype=float)
     i = int(np.argmin(top_line[:, 1]))
     y0 = int(np.floor(top_line[i, 1] + above[i, 1] - top_projected[i, 1]))
