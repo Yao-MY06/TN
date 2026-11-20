@@ -7,7 +7,8 @@
   1. 每帧照常做单帧检测，只用来得到初始四边形和逐帧诊断；
   2. 以一个公共四边形为基准，在**每一帧**上沿四条边找白边外沿点，
      同一条边在所有帧上的点合在一起做 RANSAC 拟合（不同帧挡住的位置不同，合起来就补全了）；
-  3. 交点得四角；以新四角为基准再窄带精修两轮。
+  3. 每条边用二次曲线拟合（镜头畸变下边是弯的，见 curve.py），相邻两条曲线的交点为四角；
+     以新四角为基准、沿曲线再窄带精修两轮。
   质量指标：
   * 覆盖率：每条边上，至少在一帧里找到内点的采样位置所占比例；
   * 逐帧抖动：四条边在同一帧里都有足够内点的帧，单独拟合出的四角相对汇总结果的偏差；
@@ -22,6 +23,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from .camera import CameraModel, net_geometry, solve_camera, suggest_roi
+from .curve import SideCurve, corners_from_curves, fit_curve, offset_fn, refit, side_frame
 from .detect import (
     DetectParams,
     FrameResult,
@@ -29,7 +31,6 @@ from .detect import (
     _whiteness,
     detect_frame,
     fit_line,
-    intersect,
     order_corners,
     refine_side,
 )
@@ -45,6 +46,8 @@ MIN_FULL_FRAMES_FOR_JITTER = 3  # 少于这么多"四边俱全"的帧，抖动�
 BOOTSTRAP_ROUNDS = 40
 # 一帧在某条边上至少要有这么多内点（占采样数的比例），才算这帧"这条边看得到"
 FRAME_SIDE_MIN_FRAC = 0.3
+# 边的拱高上限（占弦长比例）：超过就当作拟合到了别的东西，退回直线
+MAX_SAGITTA_FRAC = 0.02
 # 球擦网时球心最多高出网顶一个球径（4 cm），net_zone 的上沿按此外扩
 NET_ZONE_EXTRA_CM = 4.0
 
@@ -57,6 +60,7 @@ class SideStat:
     coverage: float
     rms_px: float
     frame_inliers: List[int]
+    sagitta_px: float = 0.0  # 边的弯曲程度（拱高，像素）
 
     def to_dict(self) -> Dict:
         return {
@@ -65,6 +69,7 @@ class SideStat:
             "n_inliers": self.n_inliers,
             "coverage": round(self.coverage, 3),
             "rms_px": round(self.rms_px, 3),
+            "sagitta_px": round(self.sagitta_px, 2),
         }
 
 
@@ -87,27 +92,12 @@ class CalibResult:
     camera: Optional[CameraModel] = None
     net: Dict = field(default_factory=dict)
     compat: Dict = field(default_factory=dict)
+    side_curves: Dict[str, SideCurve] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
 # 按边汇集拟合
 # ---------------------------------------------------------------------------
-
-
-def _corners_from_lines(lines) -> Optional[np.ndarray]:
-    out = []
-    for i in range(4):
-        x = intersect(lines[(i - 1) % 4][0], lines[(i - 1) % 4][1], lines[i][0], lines[i][1])
-        if x is None:
-            return None
-        out.append(x)
-    return np.array(out)
-
-
-def _lsq_line(p: np.ndarray):
-    mean = p.mean(axis=0)
-    _, _, vt = np.linalg.svd(p - mean)
-    return mean, vt[0]
 
 
 @dataclass
@@ -117,62 +107,76 @@ class _SidePool:
     frame: np.ndarray
     inlier: np.ndarray
     n_samples: int
+    curve: SideCurve
 
 
-def _pooled_pass(whites: List[np.ndarray], quad: np.ndarray, band: float, params: DetectParams, rng):
-    """以 quad 为基准在所有帧上采点，每条边合并拟合。失败返回 (None, 原因)。"""
+def _pooled_pass(whites: List[np.ndarray], quad: np.ndarray, band: float, params: DetectParams, rng,
+                 prev: Optional[Dict[str, "_SidePool"]] = None):
+    """以 quad 为基准在所有帧上采点，每条边合并拟合（二次曲线）。失败返回 (None, 原因)。
+
+    prev 给定时：搜索带沿上一轮的曲线弯曲，初始内点按上一轮曲线选；否则先用直线 RANSAC 起步。
+    """
     p_fit = replace(params, ransac_thresh_px=params.pooled_ransac_thresh_px, ransac_iters=max(params.ransac_iters, 400))
-    lines, pools = [], {}
+    curves, pools = [], {}
     for si, (name, _, _) in enumerate(SIDES):
+        off = offset_fn(prev[name].curve, quad, si) if prev is not None else None
         P, I, F, n_s = [], [], [], 0
         for fi, w in enumerate(whites):
-            pts, n_s, idx = refine_side(w, quad, si, band, params, return_index=True)
+            pts, n_s, idx = refine_side(w, quad, si, band, params, return_index=True, center_offset=off)
             P.append(pts)
             I.append(idx)
             F.append(np.full(len(pts), fi, dtype=int))
         P, I, F = np.vstack(P), np.concatenate(I), np.concatenate(F)
-        fit = fit_line(P, p_fit, rng) if len(P) >= 5 else None
-        if fit is None:
+        if len(P) < 5:
             return None, f"side_{name}_no_points"
-        mean, dirv, mask, _ = fit
-        lines.append((mean, dirv))
-        pools[name] = _SidePool(P, I, F, mask, n_s)
-    corners = _corners_from_lines(lines)
+        if prev is not None:
+            init = np.abs(prev[name].curve.residual(P)) < params.pooled_ransac_thresh_px
+        else:
+            fit = fit_line(P, p_fit, rng)
+            if fit is None:
+                return None, f"side_{name}_no_points"
+            init = fit[2]
+        _, _, _, L = side_frame(quad, si)
+        curve, mask = fit_curve(P, quad, si, init, params.pooled_ransac_thresh_px, MAX_SAGITTA_FRAC * L)
+        if mask.sum() < 5:
+            return None, f"side_{name}_no_points"
+        curves.append(curve)
+        pools[name] = _SidePool(P, I, F, mask, n_s, curve)
+    corners = corners_from_curves(curves)
     if corners is None:
-        return None, "parallel_sides"
+        return None, "curves_do_not_intersect"
     if not _is_convex(corners):
         return None, "bad_quad"
     return (corners, pools), ""
 
 
-def _side_stats(pools: Dict[str, _SidePool], corners: np.ndarray, n_frames: int) -> Dict[str, SideStat]:
+def _side_stats(pools: Dict[str, _SidePool], n_frames: int) -> Dict[str, SideStat]:
     out = {}
-    for name, ia, ib in SIDES:
+    for name, _, _ in SIDES:
         pl = pools[name]
         p = pl.pts[pl.inlier]
-        d = corners[ib] - corners[ia]
-        nrm = np.array([-d[1], d[0]]) / np.linalg.norm(d)
-        rms = float(np.sqrt(np.mean(((p - corners[ia]) @ nrm) ** 2))) if len(p) else float("nan")
+        rms = float(np.sqrt(np.mean(pl.curve.residual(p) ** 2))) if len(p) else float("nan")
         cov = len(np.unique(pl.idx[pl.inlier])) / max(pl.n_samples, 1)
         fin = np.bincount(pl.frame[pl.inlier], minlength=n_frames).tolist()
-        out[name] = SideStat(pl.n_samples, len(pl.pts), int(pl.inlier.sum()), cov, rms, fin)
+        out[name] = SideStat(pl.n_samples, len(pl.pts), int(pl.inlier.sum()), cov, rms, fin, pl.curve.sagitta_px)
     return out
 
 
 def _frame_jitter(pools: Dict[str, _SidePool], corners: np.ndarray, n_frames: int, ids: List[str]):
-    """四条边在同一帧里都有足够内点的帧，单独拟合四角；返回 (每角 RMS 偏差, 这些帧的帧号)。"""
+    """四条边在同一帧里都有足够内点的帧，单独拟合四角（曲率沿用汇总结果，只拟合位置和方向）；
+    返回 (每角相对汇总四角的 RMS 偏差, 这些帧的帧号)。"""
     per_frame = []
     full_ids = []
     for fi in range(n_frames):
-        lines = []
+        curves = []
         for name, _, _ in SIDES:
             pl = pools[name]
             sel = pl.inlier & (pl.frame == fi)
             if sel.sum() < max(5, FRAME_SIDE_MIN_FRAC * pl.n_samples):
                 break
-            lines.append(_lsq_line(pl.pts[sel]))
+            curves.append(refit(pl.curve, pl.pts[sel], fixed_c2=float(pl.curve.coef[2])))
         else:
-            c = _corners_from_lines(lines)
+            c = corners_from_curves(curves)
             if c is not None:
                 per_frame.append(c)
                 full_ids.append(ids[fi])
@@ -189,16 +193,15 @@ def _bootstrap(pools: Dict[str, _SidePool], n_frames: int, rng) -> Optional[np.n
     samples = []
     for _ in range(BOOTSTRAP_ROUNDS):
         pick = np.bincount(rng.integers(0, n_frames, n_frames), minlength=n_frames)
-        lines = []
+        curves = []
         for name, _, _ in SIDES:
             pl = pools[name]
-            w = pick[pl.frame] * pl.inlier
-            if w.sum() < 2:
+            w = pick[pl.frame[pl.inlier]]
+            if w.sum() < 5:
                 break
-            p = np.repeat(pl.pts, w, axis=0)
-            lines.append(_lsq_line(p))
+            curves.append(refit(pl.curve, pl.pts[pl.inlier], weights=w))
         else:
-            c = _corners_from_lines(lines)
+            c = corners_from_curves(curves)
             if c is not None:
                 samples.append(c)
     if len(samples) < 5:
@@ -286,13 +289,13 @@ def calibrate_frames(
     whites = [_whiteness(frames[k]) for k in ids]
     pools = None
     for band in (params.band_px, params.band2_px, params.band2_px):
-        out, why = _pooled_pass(whites, quad, band, params, rng)
+        out, why = _pooled_pass(whites, quad, band, params, rng, prev=pools)
         if out is None:
             return fail(why)
         quad, pools = out
     corners = quad
 
-    stats = _side_stats(pools, corners, len(ids))
+    stats = _side_stats(pools, len(ids))
     jitter, full_ids = _frame_jitter(pools, corners, len(ids), ids)
     boot = _bootstrap(pools, len(ids), rng)
     if jitter is not None:
@@ -345,6 +348,7 @@ def calibrate_frames(
         stats, jitter, boot, full_ids, cam, net,
     )
     res.compat = compat_fields(corners, cam, net, (w, h))
+    res.side_curves = {name: pools[name].curve for name, _, _ in SIDES}
     return res
 
 
@@ -376,4 +380,9 @@ def result_to_dict(res: CalibResult, name: str, method: str) -> Dict:
         d["net"] = {k: [[round(float(x), 2), round(float(y), 2)] for x, y in v] for k, v in res.net.items()}
         d["camera"] = None if res.camera is None else res.camera.to_dict()
         d["table_calibration"] = dict(name=name, **res.compat)
+        # 每条边的拟合曲线（画回原图目检用；镜头畸变下边是弯的）
+        d["side_curves"] = {
+            k: [[round(float(x), 2), round(float(y), 2)] for x, y in c.polyline(-0.02, 1.02, 26)]
+            for k, c in res.side_curves.items()
+        }
     return d

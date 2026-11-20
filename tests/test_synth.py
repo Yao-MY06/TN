@@ -175,3 +175,31 @@ class TestPooled(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLensDistortion(unittest.TestCase):
+    """桶形畸变下长边是弯的（实测近边拱高 3~6.6 px）：按曲线拟合，近侧角点仍应准确；按直线拟合会偏 6 px。"""
+
+    def _frames(self):
+        cam = synth.make_camera(f=1500, cam_xyh=(137, 500, 140))
+        frames, gt = {}, None
+        for s in range(6):
+            img, gt = synth.render(cam, seed=500 + s, n_occluders=1, k1=-0.18)
+            frames[f"f{s:06d}"] = img
+        return frames, gt
+
+    def test_curved_edges(self):
+        import tcalib.calibrate as C
+
+        frames, gt = self._frames()
+        res = C.calibrate_frames(frames)
+        self.assertLess(np.linalg.norm(res.corners - gt, axis=1).max(), 1.5)
+        self.assertGreater(res.side_stats["near"].sagitta_px, 3.0)
+        # 对照：强制直线时近侧角点明显偏离，说明这个测试确实在检验曲线拟合
+        old = C.MAX_SAGITTA_FRAC
+        try:
+            C.MAX_SAGITTA_FRAC = 0.0
+            straight = C.calibrate_frames(frames)
+        finally:
+            C.MAX_SAGITTA_FRAC = old
+        self.assertGreater(np.linalg.norm(straight.corners - gt, axis=1).max(), 4.0)

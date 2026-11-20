@@ -86,8 +86,12 @@ def render(
     n_occluders: int = 2,
     jpeg_quality: Optional[int] = 95,
     noise_sigma: float = 3.0,
+    k1: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """返回 (BGR 图像, 真值四角 4x2)。light_gradient 是左端亮度相对右端的比例。"""
+    """返回 (BGR 图像, 真值四角 4x2)。light_gradient 是左端亮度相对右端的比例。
+
+    k1 < 0 时加桶形畸变（径向，归一化半径为到画面中心距离 / 半对角线），真值四角同步畸变。
+    """
     rng = np.random.default_rng(seed)
     w, h = cam.size
     # 背景：带纹理的地面
@@ -138,7 +142,38 @@ def render(
     img = cv2.GaussianBlur(img, (0, 0), 0.8)
     if noise_sigma > 0:
         img = (img.astype(np.float32) + rng.normal(0, noise_sigma, img.shape)).clip(0, 255).astype(np.uint8)
+    if k1:
+        img = distort_image(img, k1)
+        corners = distort_points(corners, k1, (w, h))
     if jpeg_quality is not None:
         ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
         img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
     return img, corners
+
+
+def _norm(size):
+    w, h = size
+    c = np.array([(w - 1) / 2.0, (h - 1) / 2.0])
+    return c, float(np.hypot(w, h) / 2.0)
+
+
+def distort_points(pts: np.ndarray, k1: float, size: Tuple[int, int]) -> np.ndarray:
+    """无畸变像素 → 畸变像素。模型：p_u = p_d * (1 + k1 r_d^2)（归一化坐标），迭代求 p_d。"""
+    c, R = _norm(size)
+    pu = (np.asarray(pts, dtype=np.float64) - c) / R
+    pd = pu.copy()
+    for _ in range(50):
+        r2 = np.sum(pd * pd, axis=1, keepdims=True)
+        pd = pu / (1 + k1 * r2)
+    return pd * R + c
+
+
+def distort_image(img: np.ndarray, k1: float) -> np.ndarray:
+    h, w = img.shape[:2]
+    c, R = _norm((w, h))
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float64)
+    xd, yd = (xx - c[0]) / R, (yy - c[1]) / R
+    r2 = xd * xd + yd * yd
+    mapx = (xd * (1 + k1 * r2) * R + c[0]).astype(np.float32)
+    mapy = (yd * (1 + k1 * r2) * R + c[1]).astype(np.float32)
+    return cv2.remap(img, mapx, mapy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)

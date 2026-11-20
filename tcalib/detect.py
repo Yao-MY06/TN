@@ -36,7 +36,13 @@ class DetectParams:
     min_area_frac: float = 0.01  # 球台面积占画面比例的下限
     max_area_frac: float = 0.4
     min_chroma: float = 20.0
-    min_solidity: float = 0.85  # 色块面积 / 凸包面积 的下限  # Lab 色度低于此值的簇按比例降权
+    min_solidity: float = 0.85  # 色块面积 / 凸包面积 的下限
+    max_pieces: int = 8  # 每个颜色簇最多考虑的连通块数
+    max_seeds: int = 10  # 最多以几块（按面积从大到小）为起点去合并
+    merge_ab_dist: float = 30.0  # 两个簇的 Lab 色度 (a,b) 距离不超过此值才允许合并
+    min_piece_frac: float = 0.003  # 参与合并的连通块面积下限（占画面比例）
+    merge_min_solidity: float = 0.9  # 合并后 solidity 不得低于此值
+    merge_min_quad_fit: float = 0.9  # 合并后凸包与其四边形近似的面积比不得低于此值  # Lab 色度低于此值的簇按比例降权
     band_px: float = 28.0  # 第一轮精修：粗边两侧的搜索半宽
     band2_px: float = 8.0  # 第二轮精修
     profile_step: float = 0.5  # 剖面采样步长（像素）
@@ -164,6 +170,51 @@ def _coarse_lines(contour: np.ndarray, quad: np.ndarray) -> np.ndarray:
     return out
 
 
+def _quad_fit(hull: np.ndarray) -> float:
+    q = _quad_from_hull(hull)
+    qa = abs(cv2.contourArea(q.astype(np.float32)))
+    ha = cv2.contourArea(hull)
+    return min(qa, ha) / max(qa, ha, 1.0)
+
+
+def _external_points(mask: np.ndarray) -> np.ndarray:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    return np.vstack([c.reshape(-1, 2) for c in contours]).astype(np.int32)
+
+
+def _score_candidate(pts: np.ndarray, area: float, sh: int, sw: int, chroma: float, params: "DetectParams") -> Dict:
+    """给一个候选色块（若干连通块合并）打分；不合格的 score=0。"""
+    frac = area / (sh * sw)
+    out: Dict = {"area_frac": round(frac, 4), "score": 0.0}
+    if not (params.min_area_frac <= frac <= params.max_area_frac):
+        return out
+    hull = cv2.convexHull(pts)
+    hull_area = cv2.contourArea(hull)
+    solidity = area / max(hull_area, 1.0)
+    out["solidity"] = round(solidity, 3)
+    # 固定机位下台面不会顶到画面边上；顶到边的多是墙面、幕布、地面
+    bx, by, bw_, bh_ = cv2.boundingRect(pts)
+    if bx <= 1 or by <= 1 or bx + bw_ >= sw - 1 or by + bh_ >= sh - 1:
+        out["touches_border"] = True
+        return out
+    # 台面是实心的凸四边形：凹凸不平的大色块（幕布、地面）直接排除，不让面积项把它们抬上来
+    if solidity < params.min_solidity:
+        return out
+    quad = _quad_from_hull(hull)
+    quad_area = abs(cv2.contourArea(quad.astype(np.float32)))
+    quad_fit = min(quad_area, hull_area) / max(quad_area, hull_area, 1.0)
+    # 球台大致在画面水平方向中部
+    x0, _, bw, _ = cv2.boundingRect(pts)
+    cx = x0 + bw / 2.0
+    center_w = 1.0 - min(abs(cx / sw - 0.5) * 2, 1.0) * 0.5
+    # 台面是彩色（蓝/绿），地面、墙、白边大多是灰的：色度低的簇降权
+    chroma_w = min(chroma / params.min_chroma, 1.0) ** 2
+    score = solidity**2 * quad_fit**2 * center_w * chroma_w * np.sqrt(frac)
+    out.update(quad_fit=round(quad_fit, 3), chroma=round(chroma, 1), score=round(float(score), 4))
+    out["quad"] = _coarse_lines(pts.astype(np.float64), order_corners(quad))
+    return out
+
+
 def coarse_quad(img: np.ndarray, params: DetectParams = DetectParams()) -> Tuple[Optional[np.ndarray], Dict]:
     """返回 (原分辨率下的粗四边形, 调试信息)。找不到返回 (None, info)。"""
     h, w = img.shape[:2]
@@ -179,49 +230,48 @@ def coarse_quad(img: np.ndarray, params: DetectParams = DetectParams()) -> Tuple
 
     sh, sw = small.shape[:2]
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    best, best_score, info = None, 0.0, {"clusters": []}
+    best, best_score, info = None, 0.0, {"candidates": []}
+    # 候选块：每个颜色簇里较大的几个连通块（灰色簇不要：台面是彩色的）
+    ab = centers[:, 1:3]
+    chroma = np.hypot(ab[:, 0] - 128.0, ab[:, 1] - 128.0)
+    pieces = []  # (簇号, 面积, 外轮廓点)
     for k in range(params.kmeans_k):
+        if chroma[k] < 0.5 * params.min_chroma:
+            continue
         m = (labels == k).astype(np.uint8)
         m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel)
         m = cv2.morphologyEx(m, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
         n, cc, stats, _ = cv2.connectedComponentsWithStats(m, 8)
-        if n <= 1:
-            continue
-        j = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-        area = float(stats[j, cv2.CC_STAT_AREA])
-        frac = area / (sh * sw)
-        if not (params.min_area_frac <= frac <= params.max_area_frac):
-            info["clusters"].append({"k": k, "area_frac": round(frac, 4), "score": 0})
-            continue
-        comp = (cc == j).astype(np.uint8)
-        # 填掉内部的中线、球网等小洞
-        contours, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        cnt = max(contours, key=cv2.contourArea)
-        hull = cv2.convexHull(cnt)
-        hull_area = cv2.contourArea(hull)
-        solidity = area / max(hull_area, 1.0)
-        quad = _quad_from_hull(hull)
-        quad_area = abs(cv2.contourArea(quad.astype(np.float32)))
-        quad_fit = min(quad_area, hull_area) / max(quad_area, hull_area, 1.0)
-        # 球台大致在画面水平方向中部
-        cx = stats[j, cv2.CC_STAT_LEFT] + stats[j, cv2.CC_STAT_WIDTH] / 2.0
-        center_w = 1.0 - min(abs(cx / sw - 0.5) * 2, 1.0) * 0.5
-        # 台面是彩色（蓝/绿），地面、墙、白边大多是灰的：色度低的簇降权
-        chroma = float(np.hypot(centers[k, 1] - 128.0, centers[k, 2] - 128.0))
-        chroma_w = min(chroma / params.min_chroma, 1.0) ** 2
-        # 台面是实心的凸四边形：凹凸不平的大色块（幕布、地面）直接排除，不让面积项把它们抬上来
-        if solidity < params.min_solidity:
-            info["clusters"].append({"k": k, "area_frac": round(frac, 4), "solidity": round(solidity, 3), "score": 0})
-            continue
-        score = solidity**2 * quad_fit**2 * center_w * chroma_w * np.sqrt(frac)
-        info["clusters"].append(
-            {"k": k, "area_frac": round(frac, 4), "solidity": round(solidity, 3), "quad_fit": round(quad_fit, 3),
-             "chroma": round(chroma, 1),
-             "score": round(float(score), 4)}
-        )
-        if score > best_score:
-            best_score = score
-            best = _coarse_lines(cnt.reshape(-1, 2).astype(np.float64), order_corners(quad)) / scale
+        order = 1 + np.argsort(-stats[1:, cv2.CC_STAT_AREA]) if n > 1 else []
+        for j in list(order)[: params.max_pieces]:
+            if stats[j, cv2.CC_STAT_AREA] >= params.min_piece_frac * sh * sw:
+                pieces.append((k, float(stats[j, cv2.CC_STAT_AREA]), _external_points((cc == j).astype(np.uint8))))
+    pieces.sort(key=lambda t: -t[1])
+    # 台面可能被球网切成两半（test_1），也可能因反光被分进两个色相相近的簇（test_7）：
+    # 以较大的块为起点，把色相相近、并进来后仍然实心的块合并，再给合并结果打分。
+    groups = []
+    for si, (ks, area, pts) in enumerate(pieces[: params.max_seeds]):
+        groups.append([si])  # 单块本身也是候选
+        members = [si]
+        for j, (kj, aj, pj) in enumerate(pieces):
+            if j in members or np.linalg.norm(ab[kj] - ab[ks]) > params.merge_ab_dist:
+                continue
+            p2 = np.vstack([pts, pj])
+            s2 = (area + aj) / max(cv2.contourArea(cv2.convexHull(p2)), 1.0)
+            if s2 >= params.merge_min_solidity and _quad_fit(cv2.convexHull(p2)) >= params.merge_min_quad_fit:
+                members, area, pts = members + [j], area + aj, p2
+        if len(members) > 1:
+            groups.append(members)
+    for members in groups:
+        area = sum(pieces[j][1] for j in members)
+        pts = np.vstack([pieces[j][2] for j in members])
+        ch = sum(chroma[pieces[j][0]] * pieces[j][1] for j in members) / area
+        cand = _score_candidate(pts, area, sh, sw, float(ch), params)
+        cand["clusters"], cand["pieces"] = sorted({int(pieces[j][0]) for j in members}), len(members)
+        info["candidates"].append({kk: vv for kk, vv in cand.items() if kk != "quad"})
+        if cand["score"] > best_score:
+            best_score = cand["score"]
+            best = cand["quad"] / scale
     info["best_score"] = round(float(best_score), 4)
     if best is None:
         return None, info
@@ -254,10 +304,13 @@ def refine_side(
     params: DetectParams,
     line_px_hint: Optional[float] = None,
     return_index: bool = False,
+    center_offset=None,
 ):
     """沿一条边找白边外沿的亚像素点。
 
     返回 (Nx2 点, 采样数)；return_index=True 时再返回每个点对应的采样序号（用于算覆盖率）。
+    center_offset：可选，函数 t∈[0,1] → 像素，把每个采样点的剖面中心沿外法线挪动
+    （边在画面里是弯的时，让搜索带跟着弯曲走）。
     """
     _, ia, ib = SIDES[side_idx]
     a, b = quad[ia], quad[ib]
@@ -276,6 +329,8 @@ def refine_side(
     ts = np.linspace(m, 1 - m, n_s) * length
     ds = np.arange(-band, band + 1e-9, params.profile_step)
     base = a[None, :] + ts[:, None] * t_hat[None, :]
+    if center_offset is not None:
+        base = base + np.asarray(center_offset(ts / length), dtype=np.float64)[:, None] * n_hat[None, :]
     pts = base[:, None, :] + ds[None, :, None] * n_hat[None, None, :]
     mapx = pts[..., 0].astype(np.float32)
     mapy = pts[..., 1].astype(np.float32)

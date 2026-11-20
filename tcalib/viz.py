@@ -54,8 +54,14 @@ def draw_overlay(img: np.ndarray, d: Dict, compat: bool = True) -> np.ndarray:
             cv2.addWeighted(overlay, 0.15, out, 0.85, 0, dst=out)
             cv2.line(out, (x, z0), (x, z1), COLORS["net_x"], 1)
     q = np.array(pts)
-    for i in range(4):
-        _line(out, q[i], q[(i + 1) % 4], COLORS["quad"], 1)
+    if d.get("side_curves"):
+        # 画拟合出的曲线本身（有镜头畸变时边是弯的）
+        for poly in d["side_curves"].values():
+            p = np.round(np.array(poly) * (1 << _SHIFT)).astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(out, [p], False, COLORS["quad"], 1, cv2.LINE_AA, _SHIFT)
+    else:
+        for i in range(4):
+            _line(out, q[i], q[(i + 1) % 4], COLORS["quad"], 1)
     for i, (x, y) in enumerate(q):
         cv2.circle(out, _pt((x, y)), 4 << _SHIFT, COLORS["quad"], 1, cv2.LINE_AA, _SHIFT)
         cv2.putText(out, CORNER_NAMES[i], (int(x) + 6, int(y) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLORS["quad"], 1)
