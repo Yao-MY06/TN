@@ -34,6 +34,7 @@ from .detect import (
     order_corners,
     refine_side,
 )
+from .net import NET_TOP_HEIGHT_CM, NET_TOP_MIN_COVERAGE, detect_net_top, projected_net_top
 from .table import CORNER_NAMES, NET_HEIGHT_CM, NET_POST_OUT_CM, NET_X_CM, SIDES, TABLE_WIDTH_CM
 
 # 置信度阈值（验收标准里的数字，集中放在这里）
@@ -252,15 +253,18 @@ def compat_fields(corners: np.ndarray, cam: Optional[CameraModel], net: Dict, im
         out["net_zone"] = None
         out["note"] = "相机解算失败：只给出网底线对应的 net_x，net_zone 需手填"
         return out
-    top = cam.project(
+    top_projected = projected_net_top(cam)
+    above = cam.project(
         np.array(
             [
-                [NET_X_CM, -NET_POST_OUT_CM, NET_HEIGHT_CM + NET_ZONE_EXTRA_CM],
-                [NET_X_CM, TABLE_WIDTH_CM + NET_POST_OUT_CM, NET_HEIGHT_CM + NET_ZONE_EXTRA_CM],
+                [NET_X_CM, -NET_POST_OUT_CM, NET_TOP_HEIGHT_CM + NET_ZONE_EXTRA_CM],
+                [NET_X_CM, TABLE_WIDTH_CM + NET_POST_OUT_CM, NET_TOP_HEIGHT_CM + NET_ZONE_EXTRA_CM],
             ]
         )
     )
-    y0 = int(np.floor(top[:, 1].min()))
+    top_line = np.asarray(net["net_top_line"], dtype=float)
+    i = int(np.argmin(top_line[:, 1]))
+    y0 = int(np.floor(top_line[i, 1] + above[i, 1] - top_projected[i, 1]))
     y1 = int(np.ceil(np.array(net["net_bottom_full"])[:, 1].max()))
     out["net_zone"] = [max(y0, 0), min(y1, h)]
     return out
@@ -361,6 +365,22 @@ def calibrate_frames(
         if not (0.3 * w < cam.f < 10 * w):
             downgrade("low", f"focal={cam.f:.0f}px_implausible")
     net = net_geometry(corners, cam)
+    if cam is not None:
+        projected = projected_net_top(cam)
+        detected, net_stats = detect_net_top(frames, cam, projected)
+        net["net_top_line_projected"] = projected.tolist()
+        net["net_top_stats"] = net_stats
+        if net_stats["coverage"] >= NET_TOP_MIN_COVERAGE:
+            net["net_top_line"] = detected.tolist()
+            net["net_top_source"] = "detected"
+        else:
+            net["net_top_line"] = projected.tolist()
+            net["net_top_source"] = "projected"
+    else:
+        net["net_top_line_projected"] = None
+        net["net_top_source"] = "projected"
+        net["net_top_stats"] = {"coverage": 0.0, "n_points": 0, "n_inliers": 0,
+                                   "rms_px": None, "offset_px": None}
 
     res = CalibResult(
         corners, conf, reasons, std, std_method, len(ids), len(used), ids, used, results,
@@ -396,7 +416,15 @@ def result_to_dict(res: CalibResult, name: str, method: str) -> Dict:
         "per_frame_ok": [k for k, r in res.frame_results.items() if r.ok],
     }
     if res.corners is not None:
-        d["net"] = {k: [[round(float(x), 2), round(float(y), 2)] for x, y in v] for k, v in res.net.items()}
+        d["net"] = {}
+        for k, v in res.net.items():
+            if k == "net_top_stats":
+                d["net"][k] = {name: round(value, 3) if isinstance(value, float) else value
+                               for name, value in v.items()}
+            elif k == "net_top_source" or v is None:
+                d["net"][k] = v
+            else:
+                d["net"][k] = [[round(float(x), 2), round(float(y), 2)] for x, y in v]
         d["camera"] = None if res.camera is None else res.camera.to_dict()
         d["table_calibration"] = dict(name=name, **res.compat)
         # 每条边的拟合曲线（画回原图目检用；镜头畸变下边是弯的）

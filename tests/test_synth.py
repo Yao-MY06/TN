@@ -6,11 +6,13 @@ import os
 import sys
 import unittest
 
+import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from tcalib import camera, detect, synth  # noqa: E402
+from tcalib.net import NET_TOP_MIN_COVERAGE, detect_net_top  # noqa: E402
 from tcalib.calibrate import calibrate_frames, result_to_dict  # noqa: E402
 from tcalib.table import NET_HEIGHT_CM, NET_POST_OUT_CM, NET_X_CM, SIDES, TABLE_WIDTH_CM  # noqa: E402
 from tcalib.viz import corner_crops, draw_overlay  # noqa: E402
@@ -38,6 +40,41 @@ class TestCamera(unittest.TestCase):
             self.assertLess(np.abs(np.array(net["net_top_line"]) - true_top).max(), 0.01)
             # 网顶在图像上必须比网底高（y 更小）
             self.assertLess(np.mean(np.array(net["net_top_line"])[:, 1]), np.mean(np.array(net["net_bottom_full"])[:, 1]))
+
+    def test_net_top_detects_white_band(self):
+        cam = synth.make_camera(f=1700, cam_xyh=(60, 600, 140))
+        img, corners = synth.render(cam, seed=31, n_occluders=0, noise_sigma=0)
+        model = camera.solve_camera(corners, cam.size)
+        line, stats = detect_net_top({"f0": img}, model)
+        expected = cam.project(np.array([[NET_X_CM, -NET_POST_OUT_CM, 14.5],
+                                         [NET_X_CM, TABLE_WIDTH_CM + NET_POST_OUT_CM, 14.5]]))
+        self.assertGreaterEqual(stats["coverage"], NET_TOP_MIN_COVERAGE)
+        self.assertLess(np.abs(line - expected).max(), 1.0)
+
+    def test_net_top_detects_white_band_with_distortion(self):
+        cam = synth.make_camera(f=1200, cam_xyh=(120, 600, 190))
+        img, corners = synth.render(cam, seed=32, n_occluders=0, noise_sigma=0, k1=-0.18)
+        model = camera.solve_camera(corners, cam.size)
+        line, stats = detect_net_top({"f0": img}, model)
+        expected = synth.distort_points(
+            cam.project(np.array([[NET_X_CM, -NET_POST_OUT_CM, 14.5],
+                                  [NET_X_CM, TABLE_WIDTH_CM + NET_POST_OUT_CM, 14.5]])),
+            -0.18, cam.size)
+        self.assertGreaterEqual(stats["coverage"], NET_TOP_MIN_COVERAGE)
+        self.assertLess(np.abs(line - expected).max(), 1.0)
+
+    def test_net_top_falls_back_when_band_is_occluded(self):
+        cam = synth.make_camera()
+        img, corners = synth.render(cam, seed=33, n_occluders=0)
+        model = camera.solve_camera(corners, cam.size)
+        projected = camera.net_geometry(corners, model)["net_top_line"]
+        cv2.line(img, tuple(np.round(projected[0]).astype(int)), tuple(np.round(projected[1]).astype(int)), (40, 40, 40), 31)
+        result = calibrate_frames({"f0": img})
+        self.assertEqual(result.net["net_top_source"], "projected")
+        self.assertLess(result.net["net_top_stats"]["coverage"], NET_TOP_MIN_COVERAGE)
+        d = result_to_dict(result, "occluded", "test")
+        self.assertEqual(d["net"]["net_top_source"], "projected")
+        np.testing.assert_allclose(d["net"]["net_top_line"], d["net"]["net_top_line_projected"])
 
     def test_closed_form_focal(self):
         cam = synth.make_camera()
@@ -97,6 +134,8 @@ class TestCalibrate(unittest.TestCase):
         self.assertLess(np.linalg.norm(res.corners - gt, axis=1).max(), 1.0)
         self.assertEqual(res.confidence, "high", res.reasons)
         d = result_to_dict(res, "synth", "auto_edge_pooled_v3")
+        self.assertEqual(d["net"]["net_top_source"], "detected")
+        self.assertIn("coverage", d["net"]["net_top_stats"])
         tc = d["table_calibration"]
         self.assertEqual(len(tc["table_polygon"]), 4)
         self.assertLess(tc["net_zone"][0], tc["net_zone"][1])

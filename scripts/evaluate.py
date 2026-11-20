@@ -96,10 +96,12 @@ def main() -> None:
         )
 
     n_pass = sum(1 for v in summary.values() if v.get("status") == "pass")
+    truth_label = (os.path.relpath(args.truth, ROOT)
+                   if os.path.splitdrive(args.truth)[0] == os.path.splitdrive(ROOT)[0] else args.truth)
     lines = [
         "# 自动标定 vs 人工四角",
         "",
-        f"真值：`{os.path.relpath(args.truth, ROOT)}`。角点误差 ≤{PASS_PX:.0f}px 合格，"
+        f"真值：`{truth_label}`。角点误差 ≤{PASS_PX:.0f}px 合格，"
         f"≤{REVIEW_PX:.0f}px 需目检；抖动上限 {JITTER_PX['default']:.0f}px（test_6 为 {JITTER_PX['test_6']:.0f}px）。",
         "",
         "注意：真值是本算法（auto_edge_pooled_v3）在每段 2 张原图上的结果经人工目检确认（test_2 取同机位 test_3），"
