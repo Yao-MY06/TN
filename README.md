@@ -42,7 +42,7 @@ python scripts/calibrate_video.py --video test_2.mp4 --name test_2 --out out/tes
 python scripts/calibrate_video.py --video test_2.mp4 --name test_2 --out out/test_2 --mode spread --save-frame 1200
 # 批量 + 验收 + 打包（原机用）
 python scripts/batch_videos.py --videos videos.txt --out-root out --mode spread --count 24 \
-    --save-frame test_2:1200 --truth ../TN/calib/table_quads.json --zip results.zip
+    --save-frame test_2:1200 --truth truth/table_quads_outer.json --zip results.zip
 ```
 
 - 抽到的**所有帧**都参与按边汇集和置信度统计（覆盖率、抖动）。不按清晰度挑帧。
@@ -54,7 +54,7 @@ python scripts/batch_videos.py --videos videos.txt --out-root out --mode spread 
 ## 用法
 ```
 python scripts/calib_dir.py --frames frames/test_2 --name test_2 --out out/test_2
-python scripts/evaluate.py                        # 与 ../TN/calib/table_quads.json 比较 → out/eval.md
+python scripts/evaluate.py                        # 与 truth/table_quads_outer.json 比较 → out/eval.md
 python scripts/check_compat.py out/*/result.json  # 用国栋的 TableCalibration / TableHomography 读一遍
 python scripts/corner_crops.py --image frames/test_2/f001200.png --out out/test_2/corners.png \
     --result out/test_2/result.json --cand "manual=540,516;1330,532;1484,656;352,631"
@@ -64,14 +64,14 @@ python -m unittest discover -s tests              # 合成图 + 视频入口回�
 只依赖 numpy、opencv-python。
 
 ## 验收
-- 角点：与人工四角比，每角 ≤5 px 合格，5～8 px 目检，>8 px 不合格；9 段中至少 8 段全部合格。
+- 角点：与 truth/table_quads_outer.json（白边外沿，目检确认）比，每角 ≤5 px 合格，5～8 px 目检，>8 px 不合格；8 段全部合格（原计划"9 段中 ≥8 段"，真值现为 8 段）。
 - 抖动：每角多帧标准差 ≤2 px（test_6 ≤5 px）。
 - 网：画回原图目检（test_2 重点）；网顶投影与可见网顶白带 ≤4 px；PnPf 重投影 ≤3 px（实测 OpenTTGames 机位约 2～2.8 px，原 2 px 过严）。
 - 兼容：国栋的 `from_dict` 能读，`calibration_net_x_cm()` 在 137±1 cm。
 - 耗时：CPU 上单段 ≤30 s。
 
-注意：table_quads.json 里除 test_2（手标）外都来自自动拟合，只能说明与旧方法一致；
-test_2 的手标与同机位的 test_3、国栋 game2 在远左角差 17～21 px，先用原分辨率帧重新核定。
+真值：`truth/table_quads_outer.json`，8 段（game_4、test_1～7），本算法在每段 2 张原图上的结果经人工目检确认，
+test_2 目检略偏外，取同机位 test_3 的四角。旧的 TN/calib/table_quads.json 两端取白边内沿，仅供对比。
 
 ## 目录
 - tcalib/   算法（table / camera / detect / calibrate / video / report / viz / synth）

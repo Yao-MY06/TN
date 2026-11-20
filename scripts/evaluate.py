@@ -1,8 +1,8 @@
 """把自动标定结果和人工四角比较。
 
 用法：
-  python scripts/evaluate.py                       # 默认读 ../TN/calib/table_quads.json 与 out/*/result.json
-  python scripts/evaluate.py --truth my_truth.json # 换真值文件（比如 test_2 重新核定后）
+  python scripts/evaluate.py                       # 默认读 truth/table_quads_outer.json 与 out/*/result.json
+  python scripts/evaluate.py --truth ../TN/calib/table_quads.json   # 和旧真值（两端取白边内沿）对比
 
 判定（与计划一致）：
   每个角误差 <= 5 px 合格；5~8 px 需目检；> 8 px 不合格。
@@ -44,7 +44,7 @@ def cascade_net_x(quad) -> float:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--truth", default=os.path.join(ROOT, "..", "TN", "calib", "table_quads.json"))
+    ap.add_argument("--truth", default=os.path.join(ROOT, "truth", "table_quads_outer.json"))
     ap.add_argument("--out-root", default=os.path.join(ROOT, "out"))
     args = ap.parse_args()
 
@@ -102,7 +102,10 @@ def main() -> None:
         f"真值：`{os.path.relpath(args.truth, ROOT)}`。角点误差 ≤{PASS_PX:.0f}px 合格，"
         f"≤{REVIEW_PX:.0f}px 需目检；抖动上限 {JITTER_PX['default']:.0f}px（test_6 为 {JITTER_PX['test_6']:.0f}px）。",
         "",
-        "注意：除 test_2（手标）外，真值本身也来自自动拟合，误差小只说明与旧方法一致。",
+        "注意：真值是本算法（auto_edge_pooled_v3）在每段 2 张原图上的结果经人工目检确认（test_2 取同机位 test_3），"
+        "这里主要检验 24 帧整段运行与目检结果的一致性；目检分辨力约 1~2 px。"
+        if "outer" in os.path.basename(args.truth) else
+        "注意：这是旧真值（两端多取白边内沿），与白边外沿定义不同，两端会有 6~10 px 的系统偏差，仅供对比。",
         "",
         f"误差顺序：{' / '.join(CORNER_NAMES)}",
         "",

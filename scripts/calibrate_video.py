@@ -58,7 +58,7 @@ def run_video(
     if len(frames) < 2:
         raise RuntimeError(f"只读到 {len(frames)} 帧，无法做多帧汇总")
     res = calibrate_frames(frames, init_quad=init_quad)
-    method = "auto_edge_pooled_v2" if init_quad is None else "semi_auto_edge_pooled_v2"
+    method = "auto_edge_pooled_v3" if init_quad is None else "semi_auto_edge_pooled_v3"
     d = result_to_dict(res, name, method)
     d["runtime_s"] = round(time.time() - t0, 2)
     d["image_size"] = [info.width, info.height]

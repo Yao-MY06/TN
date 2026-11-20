@@ -73,7 +73,7 @@ def main() -> None:
     if len(sizes) != 1:
         raise SystemExit(f"帧分辨率不一致：{sizes}")
     init = parse_quad(args.init_quad) if args.init_quad else None
-    method = "auto_edge_pooled_v2" if init is None else "semi_auto_edge_pooled_v2"
+    method = "auto_edge_pooled_v3" if init is None else "semi_auto_edge_pooled_v3"
 
     t0 = time.time()
     res = calibrate_frames(frames, init_quad=init)

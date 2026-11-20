@@ -96,7 +96,7 @@ class TestCalibrate(unittest.TestCase):
         self.assertIsNotNone(res.corners)
         self.assertLess(np.linalg.norm(res.corners - gt, axis=1).max(), 1.0)
         self.assertEqual(res.confidence, "high", res.reasons)
-        d = result_to_dict(res, "synth", "auto_edge_pooled_v2")
+        d = result_to_dict(res, "synth", "auto_edge_pooled_v3")
         tc = d["table_calibration"]
         self.assertEqual(len(tc["table_polygon"]), 4)
         self.assertLess(tc["net_zone"][0], tc["net_zone"][1])

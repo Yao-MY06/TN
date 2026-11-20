@@ -96,7 +96,7 @@ def main() -> None:
     os.makedirs(args.out, exist_ok=True)
     if args.refine:
         res = calibrate_frames(frames, init_quad=pts)
-        d = result_to_dict(res, args.name, "semi_auto_edge_pooled_v2")
+        d = result_to_dict(res, args.name, "semi_auto_edge_pooled_v3")
         d["clicked_points"] = pts.round(1).tolist()
     else:
         h, w = img.shape[:2]
