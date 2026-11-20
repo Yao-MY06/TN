@@ -35,7 +35,8 @@ class DetectParams:
     kmeans_k: int = 6
     min_area_frac: float = 0.01  # 球台面积占画面比例的下限
     max_area_frac: float = 0.4
-    min_chroma: float = 20.0  # Lab 色度低于此值的簇按比例降权
+    min_chroma: float = 20.0
+    min_solidity: float = 0.85  # 色块面积 / 凸包面积 的下限  # Lab 色度低于此值的簇按比例降权
     band_px: float = 28.0  # 第一轮精修：粗边两侧的搜索半宽
     band2_px: float = 8.0  # 第二轮精修
     profile_step: float = 0.5  # 剖面采样步长（像素）
@@ -46,6 +47,7 @@ class DetectParams:
     ransac_thresh_px: float = 1.5
     ransac_iters: int = 300
     min_inlier_ratio: float = 0.35  # 低于此值，这条边判为不可靠
+    pooled_ransac_thresh_px: float = 2.0  # 多帧合并拟合时的内点阈值（容许机位轻微晃动）
 
 
 @dataclass
@@ -207,6 +209,10 @@ def coarse_quad(img: np.ndarray, params: DetectParams = DetectParams()) -> Tuple
         # 台面是彩色（蓝/绿），地面、墙、白边大多是灰的：色度低的簇降权
         chroma = float(np.hypot(centers[k, 1] - 128.0, centers[k, 2] - 128.0))
         chroma_w = min(chroma / params.min_chroma, 1.0) ** 2
+        # 台面是实心的凸四边形：凹凸不平的大色块（幕布、地面）直接排除，不让面积项把它们抬上来
+        if solidity < params.min_solidity:
+            info["clusters"].append({"k": k, "area_frac": round(frac, 4), "solidity": round(solidity, 3), "score": 0})
+            continue
         score = solidity**2 * quad_fit**2 * center_w * chroma_w * np.sqrt(frac)
         info["clusters"].append(
             {"k": k, "area_frac": round(frac, 4), "solidity": round(solidity, 3), "quad_fit": round(quad_fit, 3),
@@ -247,14 +253,18 @@ def refine_side(
     band: float,
     params: DetectParams,
     line_px_hint: Optional[float] = None,
-) -> Tuple[np.ndarray, int]:
-    """沿一条边找白边外沿的亚像素点。返回 (Nx2 点, 采样数)。"""
+    return_index: bool = False,
+):
+    """沿一条边找白边外沿的亚像素点。
+
+    返回 (Nx2 点, 采样数)；return_index=True 时再返回每个点对应的采样序号（用于算覆盖率）。
+    """
     _, ia, ib = SIDES[side_idx]
     a, b = quad[ia], quad[ib]
     d = b - a
     length = float(np.linalg.norm(d))
     if length < 10:
-        return np.zeros((0, 2)), 0
+        return (np.zeros((0, 2)), 0, np.zeros(0, int)) if return_index else (np.zeros((0, 2)), 0)
     t_hat = d / length
     n_hat = np.array([t_hat[1], -t_hat[0]])
     center = quad.mean(axis=0)
@@ -280,7 +290,7 @@ def refine_side(
     max_sep_i, min_sep_i = int(round(max_sep / step)), int(round(min_sep / step))
     win = max(int(round(2.0 / step)), 1)
 
-    out = []
+    out, out_idx = [], []
     for r in range(len(ts)):
         g = grad[r]
         # 候选外沿：最负的几个梯度
@@ -319,7 +329,11 @@ def refine_side(
                 off = float(np.clip(0.5 * (y0 - y2) / den, -0.5, 0.5))
         dpos = ds[0] + (jo + 0.5 + off) * step
         out.append(base[r] + dpos * n_hat)
-    return np.asarray(out, dtype=np.float64).reshape(-1, 2), len(ts)
+        out_idx.append(r)
+    pts_out = np.asarray(out, dtype=np.float64).reshape(-1, 2)
+    if return_index:
+        return pts_out, len(ts), np.asarray(out_idx, dtype=int)
+    return pts_out, len(ts)
 
 
 def fit_line(points: np.ndarray, params: DetectParams, rng: np.random.Generator):

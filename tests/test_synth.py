@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from tcalib import camera, detect, synth  # noqa: E402
 from tcalib.calibrate import calibrate_frames, result_to_dict  # noqa: E402
-from tcalib.table import NET_HEIGHT_CM, NET_POST_OUT_CM, NET_X_CM, TABLE_WIDTH_CM  # noqa: E402
+from tcalib.table import NET_HEIGHT_CM, NET_POST_OUT_CM, NET_X_CM, SIDES, TABLE_WIDTH_CM  # noqa: E402
 from tcalib.viz import corner_crops, draw_overlay  # noqa: E402
 
 CAMS = [
@@ -96,7 +96,7 @@ class TestCalibrate(unittest.TestCase):
         self.assertIsNotNone(res.corners)
         self.assertLess(np.linalg.norm(res.corners - gt, axis=1).max(), 1.0)
         self.assertEqual(res.confidence, "high", res.reasons)
-        d = result_to_dict(res, "synth", "auto_edge_v1")
+        d = result_to_dict(res, "synth", "auto_edge_pooled_v2")
         tc = d["table_calibration"]
         self.assertEqual(len(tc["table_polygon"]), 4)
         self.assertLess(tc["net_zone"][0], tc["net_zone"][1])
@@ -111,6 +111,66 @@ class TestCalibrate(unittest.TestCase):
         img = frames["f000000"]
         self.assertEqual(draw_overlay(img, d).shape, img.shape)
         self.assertEqual(corner_crops(img, {"auto": d["points"], "gt": gt.tolist()}).ndim, 3)
+
+
+def _occlude_side(img, gt, side, t0, t1, thick=60, color=(60, 50, 150)):
+    """在 gt 四边形的某条边上，从比例 t0 到 t1 画一段粗线，模拟站在球台端线的球员。"""
+    import cv2
+
+    _, ia, ib = SIDES[side]
+    a, b = gt[ia], gt[ib]
+    p0, p1 = a + t0 * (b - a), a + t1 * (b - a)
+    cv2.line(img, tuple(int(v) for v in p0), tuple(int(v) for v in p1), color, thick)
+    return img
+
+
+class TestPooled(unittest.TestCase):
+    """按边汇集：每帧都有一端被挡（逐帧检测失败），合起来仍应准确；某端始终被挡则置信度必须降为 low。"""
+
+    def test_every_frame_has_an_end_occluded(self):
+        cam = synth.make_camera(f=1800, cam_xyh=(120, 560, 160))
+        rng = np.random.default_rng(3)
+        frames, gt = {}, None
+        for s in range(10):
+            img, gt = synth.render(cam, seed=300 + s, n_occluders=1)
+            side = 1 if s % 2 == 0 else 3  # 右端 / 左端轮流被挡
+            t0 = rng.uniform(0.0, 0.35)
+            frames[f"f{s:06d}"] = _occlude_side(img, gt, side, t0, t0 + 0.65)
+        res = calibrate_frames(frames)
+        per_frame_ok = sum(r.ok for r in res.frame_results.values())
+        self.assertLessEqual(per_frame_ok, 3, "构造的场景应让大多数单帧检测失败")
+        self.assertIsNotNone(res.corners, res.reasons)
+        self.assertLess(np.linalg.norm(res.corners - gt, axis=1).max(), 1.5)
+        self.assertIn(res.confidence, ("high", "medium"), res.reasons)
+        for name in ("left", "right"):
+            self.assertGreaterEqual(res.side_stats[name].coverage, 0.6)
+
+    def test_end_always_hidden_is_low(self):
+        cam = synth.make_camera(f=1800, cam_xyh=(120, 560, 160))
+        frames = {}
+        for s in range(8):
+            img, gt = synth.render(cam, seed=400 + s, n_occluders=1)
+            frames[f"f{s:06d}"] = _occlude_side(img, gt, 1, 0.0, 0.85, thick=70)
+        res = calibrate_frames(frames)
+        self.assertEqual(res.confidence, "low", res.reasons)
+
+    def test_blue_backdrop_not_taken_as_table(self):
+        """test_1 那种身后一大片蓝色幕布：粗定位不能选中幕布。"""
+        import cv2
+
+        cam = synth.make_camera(f=1700)
+        img, gt = synth.render(cam, seed=9, n_occluders=0)
+        h, w = img.shape[:2]
+        backdrop = np.array([[0, 0], [w, 0], [w, int(gt[:, 1].min()) - 60], [int(0.6 * w), int(gt[:, 1].min()) - 120],
+                             [0, int(gt[:, 1].min()) - 60]], np.int32)
+        cv2.fillPoly(img, [backdrop], (140, 60, 30))  # 与台面接近的蓝色
+        # 幕布前的广告牌、裁判台等把幕布切得不成整块（test_1 实测幕布 solidity≈0.75）
+        y_b = int(gt[:, 1].min()) - 60
+        for x0 in range(100, w - 300, 450):
+            cv2.rectangle(img, (x0, y_b - 160), (x0 + 260, y_b), (200, 200, 205), -1)
+        r = detect.detect_frame(img)
+        self.assertTrue(r.ok, r.reason)
+        self.assertLess(np.linalg.norm(r.corners - gt, axis=1).max(), 1.5)
 
 
 if __name__ == "__main__":

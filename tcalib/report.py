@@ -20,15 +20,19 @@ SIDE_NAMES = ("far", "right", "near", "left")
 def write_frames_csv(path: str, res: CalibResult) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
         wr = csv.writer(f)
+        # ok/reason/四角/x_inlier：该帧单帧检测的结果（仅诊断）；pooled_*_inliers：该帧给合并拟合贡献的内点数
         head = ["frame", "ok", "reason", "used"]
         head += [f"{c}_{a}" for c in CORNER_NAMES for a in "xy"]
         head += [f"{s}_inlier" for s in SIDE_NAMES]
+        head += [f"pooled_{s}_inliers" for s in SIDE_NAMES]
         wr.writerow(head)
         for k in res.frame_ids:
             r = res.frame_results[k]
             row = [k, int(r.ok), r.reason, int(k in res.used_ids)]
             row += [round(float(v), 2) for v in r.corners.reshape(-1)] if r.corners is not None else [""] * 8
             row += [round(r.sides[s].inlier_ratio, 3) if s in r.sides else "" for s in SIDE_NAMES]
+            fi = res.frame_ids.index(k)
+            row += [res.side_stats[s].frame_inliers[fi] if s in res.side_stats else "" for s in SIDE_NAMES]
             wr.writerow(row)
 
 
